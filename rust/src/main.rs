@@ -11,6 +11,7 @@ use std::{
 
 use io::{Product, Raster, Result, write};
 use taudem_rs::profile::{self, CountingAlloc};
+use taudem_rs::tiling::{ExecutionMode, ExecutionOptions};
 use taudem_rs::{FEL_NODATA, SCALAR_NODATA, Surface, area_d8, d8_steep, pit_remove};
 
 #[global_allocator]
@@ -22,11 +23,15 @@ taudem-rs d8flowdir  -fel FILLED -p DIRECTIONS -sd8 SLOPE
 taudem-rs aread8     -p DIRECTIONS -ad8 AREA [-nc]
 taudem-rs pipeline   -z DEM [-fel FILLED] [-p DIRECTIONS] [-sd8 SLOPE] [-ad8 AREA]
                          [-4] [-depmask MASK] [-nc]
-Every subcommand also accepts --profile-json PATH.
+Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
+--max-memory BYTES (such as 4G), --tile-size CELLS and --scratch-dir DIR.
 
 All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
 without output paths. -nc disables downstream edge-contamination checks.
 --profile-json writes phase timings, counters and memory use as JSON.
+--mode tiled selects out-of-core execution, which is not yet implemented;
+auto and in-memory run in memory. --max-memory defaults to the smaller of
+65% of usable and 75% of available memory.
 Set RAYON_NUM_THREADS to control the number of worker threads.";
 
 fn main() -> ExitCode {
@@ -70,7 +75,11 @@ fn run(args: Vec<String>) -> Result<()> {
     let mut args = args[1..].iter();
     while let Some(flag) = args.next().map(String::as_str) {
         let flag = if flag == "-4way" { "-4" } else { flag };
-        if !required.contains(&flag) && !optional.contains(&flag) && flag != "--profile-json" {
+        if !required.contains(&flag)
+            && !optional.contains(&flag)
+            && flag != "--profile-json"
+            && !ExecutionOptions::FLAGS.contains(&flag)
+        {
             return Err(if matches!(flag, "-o" | "-wg" | "-sfdr") {
                 format!("{flag} is not supported in stage one")
             } else {
@@ -83,7 +92,14 @@ fn run(args: Vec<String>) -> Result<()> {
         } else {
             args.next()
                 .filter(|path| !path.starts_with('-'))
-                .ok_or_else(|| format!("{flag} requires a path"))?
+                .ok_or_else(|| {
+                    let what = if matches!(flag, "--mode" | "--max-memory" | "--tile-size") {
+                        "value"
+                    } else {
+                        "path"
+                    };
+                    format!("{flag} requires a {what}")
+                })?
         };
         if options.insert(flag, value).is_some() {
             return Err(format!("duplicate option {flag}").into());
@@ -93,6 +109,10 @@ fn run(args: Vec<String>) -> Result<()> {
         if !options.contains_key(flag) {
             return Err(format!("{command} requires {flag}\n{HELP}").into());
         }
+    }
+    let execution = ExecutionOptions::from_flags(|flag| options.get(flag).copied())?;
+    if execution.mode == ExecutionMode::Tiled {
+        return Err(format!("--mode tiled is not yet implemented for {command}").into());
     }
 
     profile::start();

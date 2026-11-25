@@ -18,6 +18,8 @@
 
 mod border;
 mod codec;
+mod config;
+pub mod memory;
 mod spec;
 mod store;
 mod writer;
@@ -25,6 +27,10 @@ mod writer;
 pub use border::{Border, BorderTable, Corner, Ring};
 pub use codec::{
     CHUNK_BYTES, Prefilter, TileElement, decode_tile, encode_tile, encoded_header_bytes,
+};
+pub use config::{
+    ExecutionMode, ExecutionOptions, FALLBACK_BUDGET, MAX_TILE_SIZE, MIN_TILE_SIZE, auto_tile_size,
+    default_memory_budget, parse_bytes,
 };
 pub use spec::{HaloWindow, Rect, TileId, TileSpec, for_each_wavefront};
 pub use store::{CacheConfig, StoreOptions, Tier, TileCache, TilePin, TileStats, TileStore};
