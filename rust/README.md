@@ -39,23 +39,29 @@ limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
 BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
 of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
-the system temporary directory). PitRemove supports out-of-core execution
-with `--mode tiled`. Auto mode selects it when the in-memory estimate
-(8 bytes per cell, or 9 with `-depmask`) exceeds the budget or the raster
-exceeds the in-memory index limit. An explicit tile side can be 16 through
-4096 if its working buffers and perimeter fit the budget.
+the system temporary directory). PitRemove and D8FlowDir support
+out-of-core execution with `--mode tiled`; their outputs are identical to
+the in-memory ones. Auto mode selects it when the in-memory estimate
+(PitRemove 8 bytes per cell, or 9 with `-depmask`; D8FlowDir about 10)
+exceeds the budget or the raster exceeds the in-memory index limit. For
+the other subcommands `--mode tiled` stops with an error and `auto` runs
+in memory. An explicit PitRemove tile side can be 16 through 4096 if its
+working buffers and perimeter fit the budget.
 
 Tiled PitRemove reads a halo around each tile, retains local fills and
 watershed labels in the budgeted `TileStore`, and writes the result as a
 sparse tiled GeoTIFF. The `pitremove_tiled::PitRemovePlan` library API takes a
 window reader and returns a solved flood. `SolvedPitRemove::emit` supplies
 filled cores and their exact one-cell halos directly to a concurrent
-consumer. See `docs/rust-port/STREAMING.md` section 3 for the tile infrastructure.
+consumer. The library's `tiling` module holds the shared infrastructure
+(tile geometry, a three-tier tile store under a memory budget, tile border
+tables, and a background GeoTIFF tile writer); see
+`docs/rust-port/STREAMING.md` section 3.
 
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and out-of-core D8FlowDir, AreaD8, and pipeline are future work.
+directions (`-sfdr`), and out-of-core AreaD8 and pipeline are future work.
 
 ## Memory and threads
 
@@ -97,6 +103,12 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
   AreaD8 walks downstream from headwater cells in parallel; the walk that
   completes a cell's last upstream neighbor sums it, adding upstream areas in
   TauDEM's fixed neighbor order, so the sums are identical for any schedule.
+- Tiled D8FlowDir (`d8_tiled`) routes each tile's flats that stay inside it
+  in the tile, and the flats that reach a tile edge pass by pass across
+  tiles: TauDEM's two increment fields are completed by label-correcting
+  relaxation over tile perimeters, and every pass uses the raster-wide
+  highest levels the in-memory resolver uses. The module documentation and
+  `docs/rust-port/STREAMING.md` section 2.3 give the exactness argument.
 
 ## Tests for tiled stages
 

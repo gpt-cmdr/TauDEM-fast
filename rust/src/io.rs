@@ -4,11 +4,11 @@ use std::{error::Error, path::Path, sync::RwLock};
 
 use taudem_rs::pitremove_tiled::SolvedPitRemove;
 use taudem_rs::tiling::{self, AsyncTileWriter, HaloWindow, Rect, TileSpec};
-use taudem_rs::{DIRECTION_NODATA, FEL_NODATA, Grid, INVALID_DIRECTION};
+use taudem_rs::{DIRECTION_NODATA, Grid, INVALID_DIRECTION};
 use terrio::raster::RasterData;
 use terrio::{
-    DataType, Error as TerrioError, GeoTiffWriter, LazyRaster, RasterDataset, RasterWriteOptions,
-    TiffReadLimits, TiffSample, Window, WindowOptions, open_raster_lazy,
+    DataType, Error as TerrioError, GeoTiffWriter, LazyRaster, RasterDataset, RasterElement,
+    RasterWriteOptions, TiffReadLimits, TiffSample, Window, WindowOptions, open_raster_lazy,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -46,6 +46,7 @@ impl Raster {
         (self.input.width(), self.input.height())
     }
 
+    /// The in-memory grid; errors above the 32-bit cell index limit.
     pub fn grid(&self) -> Result<Grid> {
         let (width, height) = self.dimensions();
         Grid::new(width, height).ok_or_else(|| "raster exceeds the 32-bit cell index limit".into())
@@ -55,8 +56,9 @@ impl Raster {
         self.input.block_size()
     }
 
-    pub fn tile_reader(&mut self) -> tiling::Result<WindowReader<'_>> {
-        WindowReader::new(&mut self.input)
+    /// Concurrent reads of tile windows and halos.
+    pub fn tile_reader(&mut self) -> tiling::Result<TileReader<'_>> {
+        TileReader::new(&mut self.input)
     }
 
     pub fn nodata(&self) -> f32 {
@@ -284,7 +286,9 @@ fn output_header(header: &RasterDataset, data_type: DataType, nodata: f64) -> Ra
     header
 }
 
-pub fn fel_block_size(spec: TileSpec) -> usize {
+/// The output block side for tiles of `spec`: 256, or the largest smaller
+/// power of two the tiles are a multiple of, so that tiles fill whole blocks.
+pub fn block_size_for(spec: &TileSpec) -> usize {
     let (w, h) = spec.tile_size();
     [256, 128, 64, 32, 16]
         .into_iter()
@@ -292,31 +296,40 @@ pub fn fel_block_size(spec: TileSpec) -> usize {
             (spec.tiles_x() == 1 || w.is_multiple_of(block))
                 && (spec.tiles_y() == 1 || h.is_multiple_of(block))
         })
-        .unwrap_or(16)
+        .unwrap_or(TILE)
 }
 
-pub fn fel_writer(
+/// A tiled GeoTIFF written in the background, compressed as [`write`]
+/// compresses and with all-nodata blocks left sparse.
+pub fn tile_writer<T: RasterElement + Default>(
     path: &str,
     header: &RasterDataset,
-    spec: TileSpec,
-) -> tiling::Result<AsyncTileWriter<f32>> {
+    spec: &TileSpec,
+    nodata: f64,
+    queue_depth: usize,
+) -> tiling::Result<AsyncTileWriter<T>> {
     if !is_tiff(path) {
         return Err(tiling::Error::Invalid(format!(
             "GeoTIFF output requires a .tif or .tiff extension: {path}"
         )));
     }
-    let header = output_header(header, DataType::F32, f64::from(FEL_NODATA));
+    let predictor = if T::DATA_TYPE == DataType::F32 {
+        "3"
+    } else {
+        "2"
+    };
+    let header = output_header(header, T::DATA_TYPE, nodata);
     let options = RasterWriteOptions {
         compression: Some("DEFLATE".into()),
-        tile_size: Some(fel_block_size(spec) as u32),
+        tile_size: Some(block_size_for(spec) as u32),
         creation_options: vec![
-            ("PREDICTOR".into(), "3".into()),
+            ("PREDICTOR".into(), predictor.into()),
             ("ZLEVEL".into(), "1".into()),
             ("SPARSE_OK".into(), "YES".into()),
         ],
         ..Default::default()
     };
-    AsyncTileWriter::create(path, &header, &options, 8)
+    AsyncTileWriter::create(path, &header, &options, queue_depth)
 }
 
 pub fn write_fel_tiles(
@@ -329,20 +342,21 @@ pub fn write_fel_tiles(
     Ok(stats)
 }
 
-/// Shared caller-buffer reads for ordinary TIFF layouts. Only layouts that
-/// require Terrio's owned-window path take the exclusive decoder lock.
-pub struct WindowReader<'a> {
+/// Concurrent caller-buffer reads of tile windows for ordinary TIFF layouts.
+/// Only layouts that require Terrio's owned-window path take the exclusive
+/// decoder lock.
+pub struct TileReader<'a> {
     input: RwLock<&'a mut LazyRaster>,
     dtype: DataType,
     strip_rows: Option<(usize, usize)>,
 }
 
-impl<'a> WindowReader<'a> {
+impl<'a> TileReader<'a> {
     fn new(input: &'a mut LazyRaster) -> tiling::Result<Self> {
         let dtype = input.band_data_type(1);
         let (block, strip_height) = input.block_size().unwrap_or((0, 0));
         let row_bytes = input.width() * input.data_type().size_bytes() * input.band_count();
-        let max_rows = TiffReadLimits::from_config()?.chunk_bytes / row_bytes;
+        let max_rows = TiffReadLimits::from_config()?.chunk_bytes / row_bytes.max(1);
         let strip_rows = (block == input.width() && max_rows < strip_height.min(input.height()))
             .then_some((max_rows.max(1), strip_height));
         Ok(Self {
@@ -352,26 +366,29 @@ impl<'a> WindowReader<'a> {
         })
     }
 
-    pub fn halo(&self, halo: HaloWindow, values: &mut [f32]) -> tiling::Result<()> {
+    /// Fills a halo buffer with the window's elevations as `f32`, each at
+    /// its place in the buffer; cells outside the raster are left as they are.
+    pub fn halo(&self, halo: &HaloWindow, buffer: &mut [f32]) -> tiling::Result<()> {
+        let window = halo.window;
         let width = halo.buffer_width();
-        // Pack the reads at the front. Move rows backwards to make space
-        // for clipped padding without allocating a second elevation window.
-        self.samples(halo.window, &mut values[..halo.window.cells()], |z| {
-            z as f32
-        })?;
-        for row in (0..halo.window.height).rev() {
-            let src = row * halo.window.width;
-            let dest = (row + halo.pad_top) * width + halo.pad_left;
-            values.copy_within(src..src + halo.window.width, dest);
+        // Read the window to the front, then move rows back to their place
+        // without allocating a second window.
+        self.samples(window, &mut buffer[..window.cells()], |z| z as f32)?;
+        for row in (0..window.height).rev() {
+            let src = row * window.width;
+            let dst = (row + halo.pad_top) * width + halo.pad_left;
+            buffer.copy_within(src..src + window.width, dst);
         }
         Ok(())
     }
 
+    /// A depression mask window: 1 where the value rounds to 1.
     pub fn mask(&self, rect: Rect, mask: &mut [u8]) -> tiling::Result<()> {
         self.samples(rect, mask, |z| u8::from(z.round() == 1.0))
     }
 
-    fn samples<T: TiffSample + Default>(
+    /// Reads `rect` of band 1 into `output`, converting each sample.
+    pub fn samples<T: TiffSample + Default>(
         &self,
         rect: Rect,
         output: &mut [T],

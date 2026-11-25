@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod d8flowdir_tiled;
 mod io;
 
 use std::{
@@ -30,10 +31,10 @@ Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
 All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
 without output paths. -nc disables downstream edge-contamination checks.
 --profile-json writes phase timings, counters and memory use as JSON.
-PitRemove supports out-of-core execution in tiled mode. Auto uses tiled
-PitRemove when its in-memory estimate exceeds the budget.
---max-memory defaults to the smaller of
-65% of usable and 75% of available memory.
+--mode tiled selects out-of-core execution within --max-memory (pitremove
+and d8flowdir only so far); auto runs them tiled when their in-memory
+estimate exceeds the budget, and in memory otherwise. --max-memory defaults
+to the smaller of 65% of usable and 75% of available memory.
 Set RAYON_NUM_THREADS to control the number of worker threads.";
 
 fn main() -> ExitCode {
@@ -113,7 +114,7 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
     let execution = ExecutionOptions::from_flags(|flag| options.get(flag).copied())?;
-    if execution.mode == ExecutionMode::Tiled && command != "pitremove" {
+    if execution.mode == ExecutionMode::Tiled && !matches!(command, "pitremove" | "d8flowdir") {
         return Err(format!("--mode tiled is not yet implemented for {command}").into());
     }
 
@@ -133,7 +134,19 @@ fn run(args: Vec<String>) -> Result<()> {
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 
-    if command == "aread8" {
+    let tiled_input = if command == "d8flowdir" && execution.mode != ExecutionMode::InMemory {
+        let raster = Raster::open(options["-fel"])?;
+        d8flowdir_tiled::wanted(&execution, &raster).then_some(raster)
+    } else {
+        None
+    };
+    if let Some(raster) = tiled_input {
+        let run = d8flowdir_tiled::run(raster, options["-p"], options["-sd8"], &execution)?;
+        cells = run.cells as u64;
+        timings.read = run.read;
+        timings.write = run.write;
+        timings.add("D8FlowDir", run.compute);
+    } else if command == "aread8" {
         let reading = profile::span("read");
         let mut raster = Raster::open(options["-p"])?;
         let grid = raster.grid()?;
@@ -329,7 +342,7 @@ fn tiled_pitremove(
                 aligned
             }
         };
-        let block = io::fel_block_size(spec);
+        let block = io::block_size_for(&spec);
         let (w, h) = spec.tile_size();
         // Regions with unaligned edges can leave partial TIFF blocks in
         // the writer at the active row and around tiles still in flight.
@@ -375,7 +388,7 @@ fn tiled_pitremove(
         let dem = raster.tile_reader()?;
         let mask = mask.as_mut().map(Raster::tile_reader).transpose()?;
         plan.solve(|halo, elevations, flags| {
-            dem.halo(halo, elevations)?;
+            dem.halo(&halo, elevations)?;
             if let (Some(reader), Some(flags)) = (&mask, flags) {
                 reader.mask(halo.core, flags)?;
             }
@@ -384,7 +397,7 @@ fn tiled_pitremove(
     };
     let output = flags["-fel"];
     let write = Instant::now();
-    let writer = io::fel_writer(output, &raster.header, spec)?;
+    let writer = io::tile_writer::<f32>(output, &raster.header, &spec, f64::from(FEL_NODATA), 8)?;
     let stats = io::write_fel_tiles(solved, writer)
         .map_err(|error| format!("writing {output}: {error}"))?;
     // Pass 2 includes overlapped compression and writing. Count only the
