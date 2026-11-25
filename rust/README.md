@@ -39,17 +39,23 @@ limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
 BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
 of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
-the system temporary directory). Tiled, out-of-core execution is not
-implemented yet: `--mode tiled` stops with an error, and `auto` and
-`in-memory` run in memory as before. The library's `tiling` module holds its
-infrastructure (tile geometry, a three-tier tile store under a memory
-budget, tile border tables, and a background GeoTIFF tile writer); see
-`docs/rust-port/STREAMING.md` section 3.
+the system temporary directory). PitRemove supports out-of-core execution
+with `--mode tiled`. Auto mode selects it when the in-memory estimate
+(8 bytes per cell, or 9 with `-depmask`) exceeds the budget or the raster
+exceeds the in-memory index limit. An explicit tile side can be 16 through
+4096 if its working buffers and perimeter fit the budget.
+
+Tiled PitRemove reads a halo around each tile, retains local fills and
+watershed labels in the budgeted `TileStore`, and writes the result as a
+sparse tiled GeoTIFF. The `pitremove_tiled::PitRemovePlan` library API takes a
+window reader and returns a solved flood. `SolvedPitRemove::emit` supplies
+filled cores and their exact one-cell halos directly to a concurrent
+consumer. See `docs/rust-port/STREAMING.md` section 3 for the tile infrastructure.
 
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and out-of-core processing are future work.
+directions (`-sfdr`), and out-of-core D8FlowDir, AreaD8, and pipeline are future work.
 
 ## Memory and threads
 

@@ -81,6 +81,17 @@ Purely in-memory changes (the domain of the concurrent optimization agent) can c
   4. **Pass 2**: Re-read raw `z` (and optional `depmask`) for tile $T$, overwrite every non-outlet perimeter cell `p` with `Z_global[p]`, seed `OUTSIDE` at `Z` and perimeter cells at `Z_global[p]`, and run local Priority-Flood. Since `Z_global[p]` already incorporates all paths inside and outside $T$, Pass 2 produces exact global `fel` for every interior cell.
 - **Evict vs Retain**: Evicting `z` and `fel_local` after Pass 1 costs **0 intermediate storage** because local DEFLATE GeoTIFFs sit in OS page cache (1.3 s to re-read ELC). Only retain if input is remote or slow uncompressed/striped.
 
+**WP-S1 implementation**: Pass 1 runs a radix-queue Priority-Flood and
+builds each tile's spill forest online with Kruskal as adjacent labels are
+settled. The global solve reuses the in-memory Kruskal minimax solver.
+Pass 2 raises the cached local fill by its watershed's solved level. The
+two intermediate layers share a budgeted `TileStore`, so this path needs
+one DEM read. Where the input contains valid negative zero, a separate
+perimeter connectivity solve preserves signed-zero bits, including in the
+final halos delivered by `SolvedPitRemove::emit`. All-nodata tiles bypass
+the flood and intermediate storage. Positioned TIFF reads handle physically
+sparse input blocks, and the output writer omits all-nodata blocks.
+
 ### 2.2 Stage 2a: D8 Steep Pass & Slope (`sd8`)
 
 - **Core 3×3 stencil** (`d8.rs:47-72`, `d8.cpp:359-409`): Any nodata or global-border 8-neighbor yields `DIRECTION_NODATA`; else `steepest` evaluates `ORDER = [1,3,5,7,2,4,6,8]` with per-row WGS84 `row_factors` (`io.rs:54-84`).

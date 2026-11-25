@@ -4,6 +4,7 @@
 mod area;
 mod d8;
 mod flood;
+pub mod pitremove_tiled;
 pub mod profile;
 pub mod tiling;
 
