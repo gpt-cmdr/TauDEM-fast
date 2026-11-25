@@ -16,9 +16,15 @@
 //!
 //! None of this changes the in-memory kernels.
 
+mod codec;
 mod spec;
+mod store;
 
+pub use codec::{
+    CHUNK_BYTES, Prefilter, TileElement, decode_tile, encode_tile, encoded_header_bytes,
+};
 pub use spec::{HaloWindow, Rect, TileId, TileSpec, for_each_wavefront};
+pub use store::{CacheConfig, StoreOptions, Tier, TileCache, TilePin, TileStats, TileStore};
 
 use std::fmt;
 
