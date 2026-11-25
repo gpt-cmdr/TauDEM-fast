@@ -122,3 +122,23 @@ fn area_leaves_cycles_unresolved_and_handles_a_single_cell() {
     assert_eq!(area_d8(grid, &[1], false), vec![1.]);
     assert_eq!(area_d8(grid, &[1], true), vec![SCALAR_NODATA]);
 }
+
+#[test]
+fn flood_priorities_sort_negative_elevations_before_positive_ones() {
+    let grid = Grid::new(3, 3).unwrap();
+    let mut z = [3., -4., 4., 7., -30., 6., -1., 0., 3.];
+    pit_remove(grid, &mut z, -9999., false, None);
+    assert_eq!(z[4], -4.);
+    assert_eq!(z[7], 0.);
+}
+
+#[test]
+fn a_valid_input_equal_to_the_output_sentinel_still_seeds_the_flood() {
+    let grid = Grid::new(5, 5).unwrap();
+    let mut z = [9.0; 25];
+    z[6] = 2.0;
+    z[11] = FEL_NODATA;
+    z[12] = -9999.0;
+    pit_remove(grid, &mut z, -9999.0, true, None);
+    assert_eq!(z[6], 2.0);
+}
