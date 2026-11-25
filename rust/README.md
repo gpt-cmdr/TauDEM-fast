@@ -45,7 +45,18 @@ directions (`-sfdr`), and out-of-core processing are future work.
 
 - PitRemove implements improved Priority-Flood with a FIFO for flooded cells.
   See Barnes, Lehman & Mulla (2014), [doi:10.1016/j.cageo.2013.04.024](https://doi.org/10.1016/j.cageo.2013.04.024).
-  Outlet and mask rules follow TauDEM's `src/flood.cpp`.
+  Outlet and mask rules follow TauDEM's `src/flood.cpp`. Large grids are
+  flooded in parallel on tiles (512 cells square by default) whose perimeter
+  cells carry labels, and the per-tile spill graphs are joined as in Barnes
+  (2016), [doi:10.1016/j.cageo.2016.07.001](https://doi.org/10.1016/j.cageo.2016.07.001):
+  each tile keeps a minimum spanning forest of its label adjacencies, a
+  Kruskal pass over all tiles gives each label its spill elevation, and every
+  cell ends at the higher of its tile fill and its label's spill elevation.
+  Filling to the lowest spill elevation has one answer, so the tiled and
+  whole-grid floods agree on every value. They can differ only in the sign of
+  a filled zero, since -0.0 and 0.0 compare equal; when the DEM contains -0.0,
+  a final pass assigns each filled zero the sign the whole-grid flood writes.
+  `pit_remove_with_tiles` selects the tile side, or the whole-grid flood with 0.
 - D8FlowDir and AreaD8 follow TauDEM's `src/d8.cpp`, `src/aread8.cpp` and
   `src/commonLib.cpp` by David Tarboton and contributors. The flat resolver
   replaces repeated scans with breadth-first traversals of each gradient.

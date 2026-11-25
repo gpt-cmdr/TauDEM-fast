@@ -8,7 +8,7 @@ pub mod profile;
 
 pub use area::area_d8;
 pub use d8::{D8Result, d8_flow};
-pub use flood::pit_remove;
+pub use flood::{MAX_TILE, pit_remove, pit_remove_with_tiles};
 
 pub const FEL_NODATA: f32 = -3.0e38;
 pub const DIRECTION_NODATA: u8 = u8::MAX;
