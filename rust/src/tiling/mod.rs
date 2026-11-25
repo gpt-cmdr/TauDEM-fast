@@ -16,10 +16,12 @@
 //!
 //! None of this changes the in-memory kernels.
 
+mod border;
 mod codec;
 mod spec;
 mod store;
 
+pub use border::{Border, BorderTable, Corner, Ring};
 pub use codec::{
     CHUNK_BYTES, Prefilter, TileElement, decode_tile, encode_tile, encoded_header_bytes,
 };
