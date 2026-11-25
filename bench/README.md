@@ -115,12 +115,14 @@ python make_dem.py --size 1e9 --out $TAUDEM_BENCH_WORK/dems/synth_1e9.tif   # ab
   * an irregular nodata edge, about 28% of the rectangle (`--no-edge` turns it off).
 * **Flat size and C++ run time.** TauDEM's flat resolution (in d8flowdir) costs much
   more than linear in the size of each flat. By default, lakes and terraces have a
-  fixed size in cells (256 and 512). Flat count then grows with area and run time
-  grows roughly linearly.
+  fixed size in cells (256 and 512), so flat count grows with area rather than any
+  single flat growing. Even so, flats dominate C++ run time. On the default 1e7 DEM
+  (about 0.5 M lake-flat cells), C++ d8flowdir spends about 450 s (1 rank) or 190 s
+  (4 ranks) in "Resolve Flat", against about 1 s for everything else. Plan C++ runs
+  at 1e8 and above accordingly, or lower `--flat-frac` / `--terrace-step` for a
+  flat-light variant.
 * `--lake-wavelength 0` makes the lakes grow with the raster instead. This is a
-  deliberate stress case. At 1e7 cells (`synth_1e7_biglakes`), C++ d8flowdir spent
-  364 s in "Resolve Flat" against about 1.5 s for everything else. Do not use that
-  setting at 1e8 or above with the C++ build unless you mean to.
+  deliberate stress case: at 1e7 cells, C++ d8flowdir took 364 s with 1 rank.
 
 ## Benchmarks
 
@@ -210,3 +212,42 @@ the GDAL that produced ReferenceResult. No cell value differs anywhere.
 What this means for taudem-rs: match ReferenceResult, which reflects modern GDAL
 behaviour. Pass CRS through unchanged, compound CRSs included. Use the GeoJSON
 layer name taken from the file name. Write a SAGA nodata value that matches the data.
+
+## taudem-rs parity status (stage one, 2026-11-25)
+
+`parity.py run --impl rs:../rust/target/release/taudem-rs.exe`: every output that
+taudem-rs can produce is **EXACT** against ReferenceResult:
+* Base: fel, 4way, depmask, depmask+4way, p/sd8 (filled and unfilled), ad8, ad8nf, int16 MED_01_01;
+* fts: fel, p, sd8, ad8;
+* Geographic: fel (including the CRS), p, sd8, ad8.
+
+The other cases are `ERROR`, from features stage one does not have yet:
+* positional basename arguments (`pitremove logan.tif`), so cases.json also has
+  `explicit`-tagged versions of those steps;
+* `-o` outlets;
+* `-wg` weights;
+* non-GeoTIFF input (VRT, HFA, AIG, BIL/BIN) and output (.img, .sdat, .bil, .bin);
+* the TauDEM rule that an unknown or missing extension becomes `.tif`.
+
+Use `--skip-tags positional ogr formats weights` to see only the algorithm parity.
+
+## Smoke timings (CLB-08, 8 cores, about 50 to 97% loaded by other work, warm cache)
+
+These numbers are indicative only. The machine was shared, and each result is
+the median of 2 or 3 repeats. Wall time includes process and MPI launch.
+
+| DEM | impl | ranks/threads | pitremove | d8flowdir | aread8 | total (separate) | fused pipeline | peak mem (largest step) |
+|---|---|---|---|---|---|---|---|---|
+| logan (1.6 M) | C++ 5.3.7 | 1 | 1.20 | 1.74 | 1.16 | 4.16 | - | 68 MiB |
+| logan | C++ | 4 | 1.57 | 2.46 | 1.20 | 4.97 | - | 128 MiB |
+| logan | rs | 1 | 0.51 | 0.50 | 0.37 | 1.31 | 0.84 | 60 MiB |
+| logan | rs | 4 | 0.51 | 0.35 | 0.34 | 1.23 | 0.70 | 62 MiB |
+| synth_1e7 (10 M, 28% nodata) | C++ | 1 | 2.89 | **454.6** | 2.95 | 460.5 | - | 331 MiB |
+| synth_1e7 | C++ | 4 | 5.69 | **190.1** | 2.79 | 198.6 | - | 410 MiB |
+| synth_1e7 | rs | 1 | 1.39 | 1.56 | 0.76 | 3.70 | 3.02 | 274 MiB |
+| synth_1e7 | rs | 4 | 1.25 | 1.30 | 0.77 | 3.32 | 2.64 | 276 MiB |
+
+On synth_1e7, taudem-rs outputs (separate and fused) are EXACT against C++ for fel,
+p, sd8 and ad8, so its flat resolution reproduces TauDEM's directions cell for cell.
+On logan, `--cross-check` gives EXACT for all four outputs at 1 and 4 threads, in
+both modes.

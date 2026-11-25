@@ -33,6 +33,7 @@ import csv
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -71,7 +72,7 @@ def run_cmd_shell(cmd: str) -> None:
 class Recorder:
     FIELDS = ["stamp", "label", "dem", "dem_cells", "impl", "impl_kind", "mode", "step", "ranks", "repeat", "cache",
               "rc", "wall_s", "peak_sum_bytes", "peak_max_proc_bytes", "peak_concurrent_bytes", "nprocs",
-              "out_bytes", "t_header_read", "t_read", "t_compute", "t_write", "t_total", "timings_json", "cmd"]
+              "out_bytes", "flat_cells", "flat_iterations", "t_header_read", "t_read", "t_compute", "t_write", "t_total", "timings_json", "cmd"]
 
     def __init__(self, res_dir: Path, stamp: str):
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +87,16 @@ class Recorder:
         with self.csv.open("a", newline="") as f:
             csv.writer(f).writerow([row.get(k, "") if k != "timings_json" else json.dumps(row.get("timings", {}))
                                     for k in self.FIELDS])
+
+
+_FLATS_RE = re.compile(r"(\d+) flats to resolve")
+_REMAIN_RE = re.compile(r"Number of flats remaining:\s*(\d+)")
+
+
+def _flat_fields(text: str) -> dict:
+    """d8flowdir prints the flat-cell count and one line per flat-resolution iteration."""
+    m = _FLATS_RE.search(text)
+    return {"flat_cells": int(m.group(1)) if m else None, "flat_iterations": len(_REMAIN_RE.findall(text)) or None}
 
 
 def _timing_fields(t: dict) -> dict:
@@ -168,7 +179,8 @@ def cmd_run(a) -> int:
                                    "peak_sum_bytes": res.peak_sum_bytes, "peak_max_proc_bytes": res.peak_max_proc_bytes,
                                    "peak_concurrent_bytes": res.peak_concurrent_bytes, "nprocs": res.nprocs_seen,
                                    "out_bytes": sum(_file_bytes(Path(subst[o])) for o in outs),
-                                   "timings": res.timings, **_timing_fields(res.timings), "cmd": " ".join(res.cmd)}
+                                   "timings": res.timings, **_timing_fields(res.timings),
+                                   **_flat_fields(res.stdout + res.stderr), "cmd": " ".join(res.cmd)}
                             if res.returncode != 0:
                                 row["error"] = (res.stderr or res.stdout)[-1500:]
                                 ok = False
