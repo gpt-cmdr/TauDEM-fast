@@ -3,12 +3,11 @@
 //! memory tests.
 
 /// The bytes of memory the process can use, as GDAL's
-/// `CPLGetUsablePhysicalRAM` counts them. Uses `terrio::usable_memory()`,
-/// which reads Linux's `/proc` and cgroup limits; where that returns `None`
-/// (Windows, until terrio implements it there) falls back to the total
-/// physical memory from `GlobalMemoryStatusEx`, capped by the process's
-/// virtual address space. Once terrio covers a platform its value is used
-/// with no change here.
+/// `CPLGetUsablePhysicalRAM` counts them: `terrio::usable_memory()` (Linux
+/// `/proc` and cgroup limits, Windows physical memory and Job Object caps,
+/// macOS `hw.memsize`). Only where terrio returns `None` (other platforms)
+/// does this fall back to the total physical memory the local `os` module
+/// reads, the same call `available_memory` makes.
 pub fn usable_memory() -> Option<u64> {
     terrio::usable_memory().or_else(os::usable_memory)
 }

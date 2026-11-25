@@ -1145,7 +1145,7 @@ dependencies = [
 [[package]]
 name = "terrio"
 version = "0.10.0"
-source = "git+https://github.com/CLB-Engineering-Corporation/terrio?branch=taudem-integration#28e6167fce44867949e2185ac0785188d8882e2e"
+source = "git+https://github.com/CLB-Engineering-Corporation/terrio?branch=taudem-integration#aaff577ca76ee30ea0b8eccd95ce64625263c07d"
 dependencies = [
  "encoding_rs",
  "fdeflate",
@@ -1186,7 +1186,7 @@ dependencies = [
 [[package]]
 name = "terrio-crs"
 version = "0.3.0"
-source = "git+https://github.com/CLB-Engineering-Corporation/terrio?branch=taudem-integration#28e6167fce44867949e2185ac0785188d8882e2e"
+source = "git+https://github.com/CLB-Engineering-Corporation/terrio?branch=taudem-integration#aaff577ca76ee30ea0b8eccd95ce64625263c07d"
 dependencies = [
  "geographiclib-rs",
  "libc",
