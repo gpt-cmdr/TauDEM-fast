@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 mod io;
+mod tiled_aread8;
 
 use std::{
     collections::HashMap,
@@ -10,6 +11,7 @@ use std::{
 };
 
 use io::{Product, Raster, Result, write};
+use taudem_rs::area_tiled::{AreaOptions, Arithmetic};
 use taudem_rs::profile::{self, CountingAlloc};
 use taudem_rs::tiling::{ExecutionMode, ExecutionOptions};
 use taudem_rs::{FEL_NODATA, SCALAR_NODATA, Surface, area_d8, d8_steep, pit_remove};
@@ -20,7 +22,7 @@ static ALLOC: CountingAlloc = CountingAlloc;
 const HELP: &str = "\
 taudem-rs pitremove  -z DEM -fel FILLED [-4] [-depmask MASK]
 taudem-rs d8flowdir  -fel FILLED -p DIRECTIONS -sd8 SLOPE
-taudem-rs aread8     -p DIRECTIONS -ad8 AREA [-nc]
+taudem-rs aread8     -p DIRECTIONS -ad8 AREA [-nc] [--exact-area]
 taudem-rs pipeline   -z DEM [-fel FILLED] [-p DIRECTIONS] [-sd8 SLOPE] [-ad8 AREA]
                          [-4] [-depmask MASK] [-nc]
 Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
@@ -29,9 +31,12 @@ Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
 All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
 without output paths. -nc disables downstream edge-contamination checks.
 --profile-json writes phase timings, counters and memory use as JSON.
---mode tiled selects out-of-core execution, which is not yet implemented;
-auto and in-memory run in memory. --max-memory defaults to the smaller of
-65% of usable and 75% of available memory.
+--mode tiled selects out-of-core execution, implemented for aread8 (other
+subcommands run in memory); auto tiles aread8 when the in-memory kernel
+would exceed --max-memory. --max-memory defaults to the smaller of 65% of
+usable and 75% of available memory. Tiled aread8 matches in-memory aread8
+bit for bit; --exact-area (tiled only) instead sums exact integer counts,
+which differ from TauDEM's float sums above 2^24 cells.
 Set RAYON_NUM_THREADS to control the number of worker threads.";
 
 fn main() -> ExitCode {
@@ -63,7 +68,7 @@ fn run(args: Vec<String>) -> Result<()> {
     let (required, optional): (&[&str], &[&str]) = match command {
         "pitremove" => (&["-z", "-fel"], &["-4", "-depmask"]),
         "d8flowdir" => (&["-fel", "-p", "-sd8"], &[]),
-        "aread8" => (&["-p", "-ad8"], &["-nc"]),
+        "aread8" => (&["-p", "-ad8"], &["-nc", "--exact-area"]),
         "pipeline" => (
             &["-z"],
             &["-fel", "-p", "-sd8", "-ad8", "-4", "-depmask", "-nc"],
@@ -87,7 +92,7 @@ fn run(args: Vec<String>) -> Result<()> {
             }
             .into());
         }
-        let value = if matches!(flag, "-4" | "-nc") {
+        let value = if matches!(flag, "-4" | "-nc" | "--exact-area") {
             ""
         } else {
             args.next()
@@ -111,7 +116,10 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
     let execution = ExecutionOptions::from_flags(|flag| options.get(flag).copied())?;
-    if execution.mode == ExecutionMode::Tiled {
+    let exact_area = options.contains_key("--exact-area");
+    let tiled =
+        command == "aread8" && tiled_aread8::use_tiled(options["-p"], &execution, exact_area)?;
+    if execution.mode == ExecutionMode::Tiled && command != "aread8" {
         return Err(format!("--mode tiled is not yet implemented for {command}").into());
     }
 
@@ -131,7 +139,18 @@ fn run(args: Vec<String>) -> Result<()> {
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 
-    if command == "aread8" {
+    if tiled {
+        let mut area = AreaOptions::new(check_contamination);
+        if exact_area {
+            area = area.with_arithmetic(Arithmetic::Exact);
+        }
+        let outcome = tiled_aread8::run(options["-p"], options["-ad8"], area, &execution)?;
+        cells = outcome.cells as usize;
+        timings.read = outcome.open;
+        timings.add("AreaD8", outcome.compute);
+        timings.write = outcome.write;
+        report_tiled(&outcome, &execution);
+    } else if command == "aread8" {
         let reading = profile::span("read");
         let mut raster = Raster::open(options["-p"])?;
         cells = raster.grid.cells();
@@ -272,6 +291,57 @@ fn run(args: Vec<String>) -> Result<()> {
         std::fs::write(path, json).map_err(|error| format!("writing {path}: {error}"))?;
     }
     Ok(())
+}
+
+/// Prints the tiled run's plan and counters and records them for `--profile-json`.
+fn report_tiled(outcome: &tiled_aread8::Outcome, execution: &ExecutionOptions) {
+    let (plan, stats) = (&outcome.plan, &outcome.stats);
+    let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+    let (tw, th) = plan.spec.tile_size();
+    println!(
+        "Tiled AreaD8: {} tiles of {tw} x {th}, {} workers, budget {:.0} MiB (workers {:.0} MiB each, cache {:.0} MiB)",
+        stats.tiles,
+        stats.workers,
+        mib(plan.budget),
+        mib(plan.worker_bytes),
+        mib(plan.cache_bytes)
+    );
+    let g = &stats.graph;
+    println!(
+        "Perimeter graph: {} exits, {} entries, {} edges, {} with inflow, {} nodata, {} on cycles, {:.1} MiB; max area {}",
+        g.nodes,
+        g.entries,
+        g.edges,
+        g.inflow_nodes,
+        g.poisoned_nodes,
+        g.cycle_nodes,
+        mib(g.bytes),
+        g.max_area
+    );
+    println!(
+        "f32 replay: {} exits over 2^24 in {} tiles, {} steps, {} operands ({:.3} s)",
+        g.replay_nodes, g.replay_tiles, g.replay_steps, g.replay_operands, g.replay_seconds
+    );
+    println!(
+        "Passes: pass 1 {:.3} s, solve {:.3} s, pass 2 {:.3} s",
+        stats.pass1_seconds, stats.solve_seconds, stats.pass2_seconds
+    );
+    if let Some(store) = &stats.store {
+        println!(
+            "Tile cache: peak resident {:.1} MiB, peak spilled {:.1} MiB ({} spill writes), scratch {}",
+            mib(store.peak_resident_bytes),
+            mib(store.peak_spilled_bytes),
+            store.spill_writes,
+            execution.scratch_dir().display()
+        );
+    }
+    stats.record_profile();
+    outcome.writer.record_profile("ad8");
+    profile::count("aread8.plan.budget_bytes", plan.budget);
+    profile::count("aread8.plan.worker_bytes", plan.worker_bytes);
+    profile::count("aread8.plan.cache_bytes", plan.cache_bytes);
+    profile::count("aread8.plan.graph_bytes", plan.graph_bytes);
+    profile::count("aread8.tile_size", tw as u64);
 }
 
 #[derive(Default)]
