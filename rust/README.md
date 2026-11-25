@@ -37,17 +37,32 @@ decoded from the start for each window. For trusted inputs that still hit the
 limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 
 Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
-BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
-of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
-the system temporary directory). PitRemove, D8FlowDir and AreaD8 support
-out-of-core execution with `--mode tiled`; their outputs are identical to
-the in-memory ones. Auto mode selects it when the in-memory estimate
-(PitRemove 8 bytes per cell, or 9 with `-depmask`; D8FlowDir about 10;
-AreaD8 6) exceeds the budget or the raster exceeds the in-memory index
-limit. For
-the other subcommands `--mode tiled` stops with an error and `auto` runs
-in memory. An explicit PitRemove tile side can be 16 through 4096 if its
-working buffers and perimeter fit the budget.
+BYTES` (such as `4G` or `512M`; default the smaller of 65% of Terrio's
+`usable_memory()` and 75% of available memory), `--tile-size CELLS` and
+`--scratch-dir DIR` (default the system temporary directory). Every
+subcommand runs out of core with `--mode tiled`, and its outputs are
+identical to the in-memory ones cell for cell. `--mode auto`, the default,
+runs tiled when the in-memory estimate exceeds the budget or the raster
+passes the in-memory limit of 4,294,967,295 cells, and prints its choice.
+The estimate is 48 MiB plus a measured peak per cell: PitRemove 6.5 bytes
+(7.5 with `-depmask`), D8FlowDir 10, AreaD8 7.5 and the pipeline 10
+(measured on Muncie, Spring Creek, the RAS 7.0 mosaic and ELC; see
+`docs/rust-port/STREAMING.md` section 6.2). An explicit tile side can be
+16 through 4096 if the working buffers and perimeters fit the budget.
+
+The tiled pipeline is fused (`taudem_rs::pipeline_tiled`): the DEM is read
+once, PitRemove hands each filled tile with its exact one-cell halo
+straight to D8FlowDir, D8FlowDir's final directions go to AreaD8 through
+the tile cache, and fel, sd8, p and ad8 are written by background tile
+writers only when requested. All stages share one tile grid, one tile
+cache and one budget. The planner divides `--max-memory` between the
+workers' buffers, the tile perimeters and graphs, the writers, a process
+reserve and the cache (at most half the budget), and halves the tile side
+from 2048 until the workers fit. Tiles beyond the cache are compressed in
+RAM and then spilled to `--scratch-dir`. On ELC (1.1 billion cells) the
+fused pipeline takes 72 to 90 s with a 1.5 GiB peak working set at
+`--max-memory 2G` (2.6 GiB at `4G`), against 68 to 96 s and 9.7 GiB in
+memory, on 8 threads of a shared workstation.
 
 Tiled PitRemove reads a halo around each tile, retains local fills and
 watershed labels in the budgeted `TileStore`, and writes the result as a
@@ -56,7 +71,7 @@ window reader and returns a solved flood. `SolvedPitRemove::emit` supplies
 filled cores and their exact one-cell halos directly to a concurrent
 consumer. The library's `tiling` module holds the shared infrastructure
 (tile geometry, a three-tier tile store under a memory budget, tile border
-tables, and a background GeoTIFF tile writer); see
+tables, a background GeoTIFF tile writer, and the worker threads); see
 `docs/rust-port/STREAMING.md` section 3.
 
 Tiled AreaD8 (`taudem_rs::area_tiled`) follows Barnes (2017),
@@ -70,18 +85,21 @@ tiles that hold them. `--exact-area` (tiled only) instead writes exact
 counts rounded once to `f32`, which differ from TauDEM above 2^24. The
 module documentation gives the exactness argument. The direction tiles are
 kept compressed in the tile store between passes and spill to
-`--scratch-dir` beyond the budget; ELC (1.1 billion cells) runs in 16 s
-with an 830 MB peak working set.
+`--scratch-dir` beyond the budget.
+
+Striped GeoTIFFs (whole rows per block, as Spring Creek's LZW strips) are
+read for tiles from full-width bands, each decoded once per row of tiles;
+the bands are charged to the budget.
 
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
-AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and the out-of-core pipeline are future work.
+AreaD8 outlet filtering (`-o`) and weight grids (`-wg`) and D8FlowDir
+imposed directions (`-sfdr`) are future work.
 
 ## Memory and threads
 
 Every stage runs on all `RAYON_NUM_THREADS` workers, and the results do not
-depend on the thread count. The fused pipeline peaks at
+depend on the thread count. The in-memory pipeline peaks at
 about 9 to 10 bytes per cell, during flat routing: the filled grid (4),
 directions (1), both flat increment fields packed in one 32-bit word per cell
 (4), and the search frontiers. PitRemove holds the grid, 16-bit tile labels
@@ -91,6 +109,10 @@ and then reuses the filled grid as the flats' artificial surface, so neither
 needs its own grid. Flat increments use 16-bit halves. A pass whose
 breadth-first distance inside a flat would exceed 65,533 cells repeats with
 32-bit halves (8 bytes per cell).
+
+Tiled runs stay within `--max-memory`. Their tile loops run on plain worker
+threads (`tiling::workers`), one per Rayon thread, never as Rayon jobs, so a
+GeoTIFF read inside a tile cannot start further tiles on the waiting thread.
 
 ## Algorithm sources
 
@@ -124,12 +146,19 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
   relaxation over tile perimeters, and every pass uses the raster-wide
   highest levels the in-memory resolver uses. The module documentation and
   `docs/rust-port/STREAMING.md` section 2.3 give the exactness argument.
+- The fused tiled pipeline (`pipeline_tiled`) composes the three tiled
+  stages on one tile grid; each stage receives exactly the inputs its
+  standalone tiled form reads, so the composition is exact
+  (`docs/rust-port/STREAMING.md` section 2.5).
 
 ## Tests for tiled stages
 
 `tests/support/` generates the tiling-boundary fixtures of
 `docs/rust-port/STREAMING.md` section 6.1 for a tile size and provides
 `assert_tiled_matches_in_memory`; include it with `mod support;`.
+`tests/pipeline_tiled.rs` checks the fused pipeline's four outputs on the
+whole suite at T = 16, 17 and 32 and 1 and 8 threads, with a spilling cache
+and in wavefront order.
 `cargo test --release --test adversarial -- --ignored` also runs the
 17.6-million-cell AreaD8 ramp, and `cargo test --release --test area_tiled
 -- --ignored` checks tiled AreaD8 on it. To check the background writer's GeoTIFFs
