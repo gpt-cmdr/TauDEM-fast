@@ -43,8 +43,8 @@ directions (`-sfdr`), and out-of-core processing are future work.
 
 ## Memory and threads
 
-PitRemove and flat routing run on all `RAYON_NUM_THREADS` workers, and the
-results do not depend on the thread count. The fused pipeline peaks at
+Every stage runs on all `RAYON_NUM_THREADS` workers, and the results do not
+depend on the thread count. The fused pipeline peaks at
 about 9 to 10 bytes per cell, during flat routing: the filled grid (4),
 directions (1), both flat increment fields packed in one 32-bit word per cell
 (4), and the search frontiers. PitRemove holds the grid, 16-bit tile labels
@@ -78,3 +78,6 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
   distances, and so the directions, do not depend on visit order. The
   crossing rule is checked in parallel and only crossing cells, and cells
   whose north or west neighbor then changes, are revisited in row-major order.
+  AreaD8 walks downstream from headwater cells in parallel; the walk that
+  completes a cell's last upstream neighbor sums it, adding upstream areas in
+  TauDEM's fixed neighbor order, so the sums are identical for any schedule.
