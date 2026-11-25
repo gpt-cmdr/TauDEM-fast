@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod d8flowdir_tiled;
 mod io;
 
 use std::{
@@ -29,9 +30,10 @@ Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
 All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
 without output paths. -nc disables downstream edge-contamination checks.
 --profile-json writes phase timings, counters and memory use as JSON.
---mode tiled selects out-of-core execution, which is not yet implemented;
-auto and in-memory run in memory. --max-memory defaults to the smaller of
-65% of usable and 75% of available memory.
+--mode tiled selects out-of-core execution within --max-memory (d8flowdir
+only so far); auto runs d8flowdir tiled when its in-memory estimate exceeds
+the budget, and in memory otherwise. --max-memory defaults to the smaller
+of 65% of usable and 75% of available memory.
 Set RAYON_NUM_THREADS to control the number of worker threads.";
 
 fn main() -> ExitCode {
@@ -111,7 +113,7 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
     let execution = ExecutionOptions::from_flags(|flag| options.get(flag).copied())?;
-    if execution.mode == ExecutionMode::Tiled {
+    if execution.mode == ExecutionMode::Tiled && command != "d8flowdir" {
         return Err(format!("--mode tiled is not yet implemented for {command}").into());
     }
 
@@ -131,16 +133,28 @@ fn run(args: Vec<String>) -> Result<()> {
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 
-    if command == "aread8" {
+    let tiled_input = if command == "d8flowdir" && execution.mode != ExecutionMode::InMemory {
+        let raster = Raster::open(options["-fel"])?;
+        d8flowdir_tiled::wanted(&execution, &raster).then_some(raster)
+    } else {
+        None
+    };
+    if let Some(raster) = tiled_input {
+        let run = d8flowdir_tiled::run(raster, options["-p"], options["-sd8"], &execution)?;
+        cells = run.cells;
+        timings.read = run.read;
+        timings.write = run.write;
+        timings.add("D8FlowDir", run.compute);
+    } else if command == "aread8" {
         let reading = profile::span("read");
         let mut raster = Raster::open(options["-p"])?;
-        cells = raster.grid.cells();
+        cells = raster.grid()?.cells();
         let direction = raster.directions()?;
         drop(reading);
         timings.read = total.elapsed();
         let start = Instant::now();
         let span = profile::span("aread8");
-        let area = area_d8(raster.grid, &direction, check_contamination);
+        let area = area_d8(raster.grid()?, &direction, check_contamination);
         drop(span);
         timings.stage("AreaD8", start);
         output(
@@ -153,7 +167,7 @@ fn run(args: Vec<String>) -> Result<()> {
         let fill = command != "d8flowdir";
         let reading = profile::span("read");
         let mut raster = Raster::open(options[if fill { "-z" } else { "-fel" }])?;
-        cells = raster.grid.cells();
+        cells = raster.grid()?.cells();
         let nodata = raster.nodata();
         let mut elevations = raster.elevations()?;
         let mask = if let Some(path) = options.get("-depmask") {
@@ -174,7 +188,7 @@ fn run(args: Vec<String>) -> Result<()> {
             let start = Instant::now();
             let span = profile::span("pitremove");
             pit_remove(
-                raster.grid,
+                raster.grid()?,
                 &mut elevations,
                 nodata,
                 options.contains_key("-4"),
@@ -194,7 +208,7 @@ fn run(args: Vec<String>) -> Result<()> {
             let start = Instant::now();
             let span = profile::span("d8flowdir.steep");
             let steep = d8_steep(
-                raster.grid,
+                raster.grid()?,
                 &elevations,
                 if fill { FEL_NODATA } else { nodata },
                 &spacing,
@@ -223,7 +237,7 @@ fn run(args: Vec<String>) -> Result<()> {
             if command == "pipeline" {
                 let start = Instant::now();
                 let span = profile::span("aread8");
-                let area = area_d8(raster.grid, &direction, check_contamination);
+                let area = area_d8(raster.grid()?, &direction, check_contamination);
                 drop(span);
                 timings.stage("AreaD8", start);
                 output(

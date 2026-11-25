@@ -842,7 +842,7 @@ impl TiledD8 {
 
     /// Pass C: routes the deferred flats and delivers the directions of
     /// every tile `process_tile` did not finish.
-    pub fn finish(self, finished: &TileSink<'_, u8>) -> Result<D8Outcome> {
+    pub fn finish(self, finished: &TileOutput<'_, u8>) -> Result<D8Outcome> {
         if self.schedule == SteepSchedule::Parallel
             && (self.crossing.load(Relaxed) || self.seam_crossing())
         {
@@ -1155,7 +1155,7 @@ impl TiledD8 {
         tables: Tables<'_>,
         next: Tables<'_>,
         constants: Constants,
-        finished: &TileSink<'_, u8>,
+        finished: &TileOutput<'_, u8>,
     ) -> Result<u64> {
         let halo = self.spec.halo_window(id);
         let rect = halo.core;
@@ -1738,7 +1738,7 @@ pub fn halo_from_grid<T: Copy>(
 /// Fills a tile's radius-1 halo buffer of filled elevations.
 pub type ReadTile<'a> = dyn Fn(TileId, &HaloWindow, &mut Vec<f32>) -> Result<()> + Sync + 'a;
 /// Receives a tile's row-major core values.
-pub type TileSink<'a, T> = dyn Fn(TileId, &[T]) -> Result<()> + Sync + 'a;
+pub type TileOutput<'a, T> = dyn Fn(TileId, &[T]) -> Result<()> + Sync + 'a;
 
 /// Runs tiled D8 over every tile of `spec`: `read` fills a tile's radius-1
 /// halo of filled elevations, `slope` receives each tile's `sd8` and
@@ -1754,46 +1754,94 @@ pub fn d8_flow_tiled(
     cache: &TileCache,
     schedule: SteepSchedule,
     read: &ReadTile<'_>,
-    slope: Option<&TileSink<'_, f32>>,
-    direction: &TileSink<'_, u8>,
+    slope: Option<&TileOutput<'_, f32>>,
+    direction: &TileOutput<'_, u8>,
 ) -> Result<D8Outcome> {
     let d8 = TiledD8::new(spec, nodata, spacing, cache, schedule)?;
-    let buffers: Mutex<Vec<(Vec<f32>, Vec<f32>)>> = Mutex::new(Vec::new());
-    let visit = |id: TileId| -> Result<()> {
-        if d8.crossing_detected() {
-            return Ok(());
-        }
-        let (mut fel, mut sd8) = buffers
-            .lock()
+    let pool: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
+    let buffer = || {
+        pool.lock()
             .unwrap_or_else(|p| p.into_inner())
             .pop()
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    let give_back = |b: Vec<f32>| pool.lock().unwrap_or_else(|p| p.into_inner()).push(b);
+    let load = |id: TileId, fel: &mut Vec<f32>| {
         let halo = spec.halo_window(id);
         fel.clear();
         fel.resize(halo.buffer_cells(), f32::NAN);
-        read(id, &halo, &mut fel)?;
-        d8.process_tile(id, &fel, slope.is_some().then_some(&mut sd8), |dirs| {
+        read(id, &halo, fel)
+    };
+    let compute = |id: TileId, fel: &[f32]| -> Result<()> {
+        if d8.crossing_detected() {
+            return Ok(());
+        }
+        let mut sd8 = buffer();
+        d8.process_tile(id, fel, slope.is_some().then_some(&mut sd8), |dirs| {
             direction(id, dirs)
         })?;
         if let Some(sink) = slope {
             sink(id, &sd8)?;
         }
-        buffers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((fel, sd8));
+        give_back(sd8);
         Ok(())
     };
     {
         let _span = profile::span("d8.tiled.tiles");
         match schedule {
             SteepSchedule::Parallel => {
-                let ids: Vec<TileId> = spec.row_major().collect();
-                ids.into_par_iter().try_for_each(visit)?;
+                // One plain thread reads tiles ahead of the workers. A worker
+                // waiting on a read that runs on another Rayon pool would
+                // steal and nest further tiles, unbounding the tiles in
+                // flight; the channel bounds them instead.
+                let threads = rayon::current_num_threads();
+                let (sender, receiver) = std::sync::mpsc::sync_channel(threads);
+                let stop = AtomicBool::new(false);
+                let read_ns = AtomicU64::new(0);
+                std::thread::scope(|scope| -> Result<()> {
+                    let (stop, read_ns, d8, buffer, load) = (&stop, &read_ns, &d8, &buffer, &load);
+                    let producer = scope.spawn(move || -> Result<()> {
+                        for id in spec.row_major() {
+                            if stop.load(Relaxed) || d8.crossing_detected() {
+                                break;
+                            }
+                            let mut fel = buffer();
+                            let start = Instant::now();
+                            load(id, &mut fel)?;
+                            read_ns.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+                            if sender.send((id, fel)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    });
+                    let consumed = receiver.into_iter().par_bridge().try_for_each(
+                        |(id, fel): (TileId, Vec<f32>)| {
+                            let result = compute(id, &fel);
+                            give_back(fel);
+                            if result.is_err() {
+                                stop.store(true, Relaxed);
+                            }
+                            result
+                        },
+                    );
+                    stop.store(true, Relaxed);
+                    let produced = producer
+                        .join()
+                        .unwrap_or_else(|_| Err(Error::Invalid("the tile reader panicked".into())));
+                    consumed.and(produced)
+                })?;
+                profile::count("d8.tiled.read_us", read_ns.load(Relaxed) / 1000);
             }
-            SteepSchedule::Wavefront => for_each_wavefront(&spec, visit)?,
+            SteepSchedule::Wavefront => for_each_wavefront(&spec, |id| {
+                let mut fel = buffer();
+                load(id, &mut fel)?;
+                let result = compute(id, &fel);
+                give_back(fel);
+                result
+            })?,
         }
     }
-    drop(buffers);
+    drop(pool);
     d8.finish(direction)
 }
