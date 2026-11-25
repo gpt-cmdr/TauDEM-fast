@@ -13,6 +13,7 @@
 //!   compute threads compress tiles.
 //! - [`ExecutionOptions`]: `--max-memory`, `--tile-size`, `--scratch-dir` and
 //!   `--mode`, and the default memory budget.
+//! - [`workers`]: the plain worker threads every tile loop runs on.
 //!
 //! None of this changes the in-memory kernels.
 
@@ -22,6 +23,7 @@ mod config;
 pub mod memory;
 mod spec;
 mod store;
+pub mod workers;
 mod writer;
 
 pub use border::{Border, BorderTable, Corner, Ring};

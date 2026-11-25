@@ -5,15 +5,13 @@
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
-
-use rayon::prelude::*;
 
 use crate::flood::{FloodQueue, minimax, priority};
 use crate::tiling::{
     BorderTable, Error, ExecutionOptions, HaloWindow, Rect, Result, StoreOptions, Tier, TileCache,
-    TileId, TileSpec, TileStats,
+    TileId, TileSpec, TileStats, workers,
 };
 use crate::{DX, DY, FEL_NODATA, Grid, MAX_TILE, missing, profile};
 
@@ -60,6 +58,34 @@ impl SpillLevels {
     }
 }
 
+/// Working bytes of one worker for tiles of `w x h`: I/O and codec buffers,
+/// local flood queues and Pass 2's windows, with GeoTIFF block scratch
+/// reserved even for small compute tiles.
+pub fn worker_bytes(w: usize, h: usize) -> u64 {
+    48 * ((w + 2) * (h + 2)) as u64 + (2 << 20)
+}
+
+/// Peak bytes of the perimeter graph of `spec`: local forests, the global
+/// edge list and union-find, the temporary signed-zero graph and the final
+/// border table.
+pub fn graph_bytes(spec: &TileSpec) -> u64 {
+    112 * perimeter_capacity(*spec) + 768 * spec.tile_count() as u64
+}
+
+/// The order in which [`SolvedPitRemove::emit_in`] hands tiles over.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmitOrder {
+    /// Row-major, the order Pass 1 stored them.
+    #[default]
+    RowMajor,
+    /// Reverse row-major: the tiles Pass 1 stored last, which a budgeted
+    /// cache still holds uncompressed, come out first.
+    Reverse,
+    /// Each tile after its west and north neighbors were consumed (for
+    /// D8's crossing rule).
+    Wavefront,
+}
+
 /// Bounded execution parameters for a tiled PitRemove. The caller can choose
 /// a smaller tile size or a larger budget if construction fails.
 #[derive(Clone)]
@@ -71,6 +97,8 @@ pub struct PitRemovePlan {
     nodata: f32,
     step: usize,
     has_mask: bool,
+    /// The tier Pass 1's tiles are put in.
+    initial: Tier,
 }
 
 impl PitRemovePlan {
@@ -93,12 +121,8 @@ impl PitRemovePlan {
                 "PitRemove needs fewer than 2^32 perimeter nodes; increase --tile-size".into(),
             ));
         }
-        // Includes local forests, the global edge list and union-find, the
-        // temporary signed-zero graph, and the final border table.
-        let graph_bytes = 112 * perimeter + 768 * spec.tile_count() as u64;
-        // Includes I/O and codec buffers, local flood queues, and Pass 2's
-        // windows. Reserve GeoTIFF block scratch even for small compute tiles.
-        let worker_bytes = 48 * ((w + 2) * (h + 2)) as u64 + (2 << 20);
+        let graph_bytes = graph_bytes(&spec);
+        let worker_bytes = worker_bytes(w, h);
         let available = options.memory_budget().saturating_sub(graph_bytes);
         let workers = (available / worker_bytes)
             .min(rayon::current_num_threads() as u64)
@@ -117,7 +141,48 @@ impl PitRemovePlan {
             nodata,
             step: if four_way { 2 } else { 1 },
             has_mask,
+            initial: Tier::Compressed,
         })
+    }
+
+    /// A plan with a fixed worker count whose tiles live in a cache the
+    /// caller provides to [`Self::solve_in`] (the fused pipeline's shared
+    /// cache); the caller accounts for its memory.
+    pub fn with_workers(
+        spec: TileSpec,
+        workers: usize,
+        nodata: f32,
+        four_way: bool,
+        has_mask: bool,
+    ) -> Result<Self> {
+        let (w, h) = spec.tile_size();
+        if w.max(h) > MAX_TILE {
+            return Err(Error::Invalid(format!(
+                "PitRemove tile sides must be at most {MAX_TILE}"
+            )));
+        }
+        if perimeter_capacity(spec) >= u32::MAX as u64 {
+            return Err(Error::Invalid(
+                "PitRemove needs fewer than 2^32 perimeter nodes; increase --tile-size".into(),
+            ));
+        }
+        Ok(Self {
+            spec,
+            workers: workers.clamp(1, spec.tile_count()),
+            cache_bytes: 0,
+            options: ExecutionOptions::default(),
+            nodata,
+            step: if four_way { 2 } else { 1 },
+            has_mask,
+            initial: Tier::Compressed,
+        })
+    }
+
+    /// Keeps Pass 1's tiles uncompressed in the cache until its budget
+    /// evicts them (by default they are compressed at once).
+    pub fn keep_raw(mut self) -> Self {
+        self.initial = Tier::Ram;
+        self
     }
 
     pub fn spec(&self) -> TileSpec {
@@ -137,8 +202,19 @@ impl PitRemovePlan {
         read: impl Fn(HaloWindow, &mut [f32], Option<&mut [u8]>) -> Result<()> + Sync,
     ) -> Result<SolvedPitRemove> {
         let cache = TileCache::new(self.options.cache_config(self.cache_bytes));
+        self.solve_in(&cache, read)
+    }
+
+    /// [`Self::solve`] with the intermediate tiles in `cache`, which may be
+    /// shared with later stages (one budget for the whole pipeline).
+    pub fn solve_in(
+        &self,
+        cache: &TileCache,
+        read: impl Fn(HaloWindow, &mut [f32], Option<&mut [u8]>) -> Result<()> + Sync,
+    ) -> Result<SolvedPitRemove> {
+        let cache = cache.clone();
         let store_options = StoreOptions {
-            initial: Tier::Compressed,
+            initial: self.initial,
             ..Default::default()
         };
         let elevations = cache.store("pitremove.local_fel", store_options);
@@ -212,31 +288,22 @@ impl PitRemovePlan {
         Ok(result)
     }
 
-    fn for_each_tile<S: Default>(
+    /// Runs `f` on every tile index on the plan's workers (plain threads,
+    /// [`workers`]), each with its own scratch.
+    fn for_each_tile<S: Default + Send>(
         &self,
         f: impl Fn(usize, &mut S) -> Result<()> + Sync,
     ) -> Result<()> {
-        let next = AtomicUsize::new(0);
-        let failed = AtomicBool::new(false);
-        (0..self.workers).into_par_iter().try_for_each(|_| {
-            let mut scratch = S::default();
-            while !failed.load(Relaxed) {
-                let index = next.fetch_add(1, Relaxed);
-                if index >= self.spec.tile_count() {
-                    break;
-                }
-                if let Err(error) = f(index, &mut scratch) {
-                    failed.store(true, Relaxed);
-                    return Err(error);
-                }
-            }
-            Ok(())
+        workers::run::<S>(self.workers, self.spec.tile_count(), |scratch, index| {
+            f(index, scratch).map(|()| 0)
         })
+        .map(drop)
     }
 }
 
 /// Pass timing and cache counters. A tile carries two independently cached
 /// layers (elevation and labels), plus zero labels on signed-zero terrains.
+#[derive(Clone, Debug)]
 pub struct PitRemoveStats {
     pub pass1: Duration,
     pub graph: Duration,
@@ -287,6 +354,15 @@ impl SolvedPitRemove {
         self,
         consume: impl Fn(FilledTile<'_>) -> Result<()> + Sync,
     ) -> Result<PitRemoveStats> {
+        self.emit_in(EmitOrder::RowMajor, consume)
+    }
+
+    /// [`Self::emit`] with the tiles handed over in `order`.
+    pub fn emit_in(
+        self,
+        order: EmitOrder,
+        consume: impl Fn(FilledTile<'_>) -> Result<()> + Sync,
+    ) -> Result<PitRemoveStats> {
         let spilled_tiles = if self.cache.stats().spill_writes == 0 {
             0
         } else {
@@ -307,7 +383,8 @@ impl SolvedPitRemove {
         profile::count("pitremove.tiled.empty_tiles", self.empty_tiles);
         let pass = profile::span("pitremove.tiled.pass2");
         let start = Instant::now();
-        self.plan.for_each_tile::<OutputScratch>(|index, scratch| {
+        let count = self.plan.spec.tile_count();
+        let visit = |scratch: &mut OutputScratch, index: usize| -> Result<()> {
             let id = self.plan.spec.id_at(index);
             let halo = self.plan.spec.halo_window(id);
             let populated = self.numeric_tile(index, scratch)?;
@@ -346,10 +423,26 @@ impl SolvedPitRemove {
                 core: &scratch.core,
                 all_nodata: !populated,
             })
-        })?;
+        };
+        match order {
+            EmitOrder::RowMajor => self
+                .plan
+                .for_each_tile::<OutputScratch>(|index, scratch| visit(scratch, index))?,
+            EmitOrder::Reverse => self.plan.for_each_tile::<OutputScratch>(|index, scratch| {
+                visit(scratch, count - 1 - index)
+            })?,
+            EmitOrder::Wavefront => {
+                let mut states: Vec<OutputScratch> = (0..self.plan.workers)
+                    .map(|_| OutputScratch::default())
+                    .collect();
+                workers::wavefront(&self.plan.spec, &mut states, |scratch, id| {
+                    visit(scratch, self.plan.spec.index(id))
+                })?;
+            }
+        }
         drop(pass);
+        // The caller records the counters (the cache may be shared).
         let cache = self.cache.stats();
-        cache.record_profile();
         Ok(PitRemoveStats {
             pass1: self.pass1,
             graph: self.graph,

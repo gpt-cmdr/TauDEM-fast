@@ -61,11 +61,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-use rayon::prelude::*;
-
 use crate::tiling::{
     Border, BorderTable, Error, HaloWindow, Rect, Result, Ring, StoreOptions, TileCache, TileId,
-    TileSpec, TileStore, for_each_wavefront,
+    TileSpec, TileStore, for_each_wavefront, workers,
 };
 use crate::{DIRECTION_NODATA, DX, DY, ORDER, SCALAR_NODATA, missing, profile};
 
@@ -479,6 +477,8 @@ struct Scratch {
     seeds2: Vec<(u32, u32)>,
     routed: Vec<u8>,
     core: Vec<u8>,
+    /// Step masks read while relaxing.
+    adj: Vec<u16>,
 }
 
 struct ScratchGuard<'a> {
@@ -630,6 +630,8 @@ pub struct TiledD8 {
     crossing: AtomicBool,
     scratch: Mutex<Vec<Scratch>>,
     counters: Counters,
+    /// Worker threads of Pass C ([`workers`]).
+    workers: usize,
 }
 
 impl TiledD8 {
@@ -670,7 +672,14 @@ impl TiledD8 {
             crossing: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
             counters: Counters::default(),
+            workers: workers::threads(),
         })
+    }
+
+    /// Sets the worker threads of [`Self::finish`] (by default the current
+    /// Rayon pool's size when the run was created).
+    pub fn set_workers(&mut self, workers: usize) {
+        self.workers = workers.max(1);
     }
 
     pub fn spec(&self) -> &TileSpec {
@@ -913,8 +922,8 @@ impl TiledD8 {
 
     /// Whether a perimeter cell's unrestricted direction crosses that of its
     /// north or west neighbor in the adjacent tile.
-    fn seam_crossing(&self) -> bool {
-        (0..self.spec.tile_count()).into_par_iter().any(|index| {
+    fn seam_crossing(&self) -> Result<bool> {
+        let found = workers::map(self.workers, self.spec.tile_count(), |index| {
             let id = self.spec.id_at(index);
             let border = self.dirs.read(id).clone();
             let ring = self.dirs.ring(id, DIRECTION_NODATA);
@@ -926,15 +935,16 @@ impl TiledD8 {
                 let w = ring.west[y];
                 (d == 4 && w == 2) || (d == 6 && w == 8)
             });
-            top || left
-        })
+            Ok(top || left)
+        })?;
+        Ok(found.into_iter().any(|f| f))
     }
 
     /// Pass C: routes the deferred flats and delivers the directions of
     /// every tile `process_tile` did not finish.
     pub fn finish(self, finished: &TileOutput<'_, u8>) -> Result<D8Outcome> {
         if self.schedule == SteepSchedule::Parallel
-            && (self.crossing.load(Relaxed) || self.seam_crossing())
+            && (self.crossing.load(Relaxed) || self.seam_crossing()?)
         {
             return Ok(D8Outcome::CrossingDetected);
         }
@@ -985,10 +995,9 @@ impl TiledD8 {
                 },
                 OwnedTables::view,
             );
-            let edges: Vec<Vec<EdgeCell>> = active
-                .par_iter()
-                .map(|&id| self.edge_cells(id, tables.elev))
-                .collect();
+            let edges: Vec<Vec<EdgeCell>> = workers::map(self.workers, active.len(), |a| {
+                Ok(self.edge_cells(active[a], tables.elev))
+            })?;
             self.relax(&active, &edges, tables, &mut p)?;
 
             let (pass_fall, pass_rise) = active
@@ -1011,10 +1020,9 @@ impl TiledD8 {
                 unresolved: last_fall.max(1) + 2,
                 last_rise,
             };
-            let remaining: Vec<u64> = active
-                .par_iter()
-                .map(|&id| self.route_tile(id, tables, next.view(), constants, finished))
-                .collect::<Result<_>>()?;
+            let remaining: Vec<u64> = workers::map(self.workers, active.len(), |a| {
+                self.route_tile(active[a], tables, next.view(), constants, finished)
+            })?;
             p.remaining = remaining.iter().sum();
             p.seconds = start.elapsed().as_secs_f64();
             active = active
@@ -1219,11 +1227,12 @@ impl TiledD8 {
             }
             p.rounds += 1;
             p.relax_checks += pending.len() as u64;
-            pending.par_iter().try_for_each(|&a| {
+            workers::run::<()>(self.workers, pending.len(), |_, j| {
+                let a = pending[j];
                 if self.relax_tile(active[a], &edges[a], tables, &dirty, &is_active)? {
                     loads.fetch_add(1, Relaxed);
                 }
-                Ok::<(), Error>(())
+                Ok(0)
             })?;
         }
         p.relax_loads = loads.load(Relaxed);
@@ -1290,10 +1299,12 @@ impl TiledD8 {
             return Ok(false);
         }
         let layers = &self.layers;
-        let adj = layers
-            .adj
-            .take(id)?
-            .ok_or_else(|| missing_tile(id, "adj"))?;
+        // The step masks do not change while relaxing: read them in place so
+        // that a compressed copy stays valid and is not compressed again.
+        let mut adj = std::mem::take(&mut s.adj);
+        if !layers.adj.try_get_into(id, &mut adj)? {
+            return Err(missing_tile(id, "adj"));
+        }
         let mut rise = std::mem::take(&mut s.rise);
         let mut fall = self.take_levels(id, &mut rise)?;
         for &(v, i) in s.seeds.iter() {
@@ -1325,7 +1336,7 @@ impl TiledD8 {
         tables.rise.set_from_halo(id, &halo, &rise)?;
         let changed = *tables.fall.read(id) != fall_around.border
             || *tables.rise.read(id) != rise_around.border;
-        layers.adj.put_owned(id, adj)?;
+        s.adj = adj;
         self.put_levels(id, fall, &rise)?;
         s.rise = rise;
         if changed {
@@ -2006,46 +2017,19 @@ pub fn d8_flow_tiled(
         let _span = profile::span("d8.tiled.tiles");
         match schedule {
             SteepSchedule::Parallel => {
-                // One plain thread reads tiles ahead of the workers. A worker
-                // waiting on a read that runs on another Rayon pool would
-                // steal and nest further tiles, unbounding the tiles in
-                // flight; the channel bounds them instead.
-                let threads = rayon::current_num_threads();
-                let (sender, receiver) = std::sync::mpsc::sync_channel(threads);
-                let stop = AtomicBool::new(false);
+                // Plain worker threads read and compute their own tiles
+                // ([`workers`]): a Rayon worker waiting on a read that runs on
+                // terrio's pool would steal and nest further tiles.
                 let read_ns = AtomicU64::new(0);
-                std::thread::scope(|scope| -> Result<()> {
-                    let (stop, read_ns, d8, buffer, load) = (&stop, &read_ns, &d8, &buffer, &load);
-                    let producer = scope.spawn(move || -> Result<()> {
-                        for id in spec.row_major() {
-                            if stop.load(Relaxed) || d8.crossing_detected() {
-                                break;
-                            }
-                            let mut fel = buffer();
-                            let start = Instant::now();
-                            load(id, &mut fel)?;
-                            read_ns.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-                            if sender.send((id, fel)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(())
-                    });
-                    let consumed = receiver.into_iter().par_bridge().try_for_each(
-                        |(id, fel): (TileId, Vec<f32>)| {
-                            let result = compute(id, &fel);
-                            give_back(fel);
-                            if result.is_err() {
-                                stop.store(true, Relaxed);
-                            }
-                            result
-                        },
-                    );
-                    stop.store(true, Relaxed);
-                    let produced = producer
-                        .join()
-                        .unwrap_or_else(|_| Err(Error::Invalid("the tile reader panicked".into())));
-                    consumed.and(produced)
+                workers::run::<Vec<f32>>(workers::threads(), spec.tile_count(), |fel, index| {
+                    if d8.crossing_detected() {
+                        return Ok(0);
+                    }
+                    let id = spec.id_at(index);
+                    let start = Instant::now();
+                    load(id, fel)?;
+                    read_ns.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+                    compute(id, fel).map(|()| 0)
                 })?;
                 profile::count("d8.tiled.read_us", read_ns.load(Relaxed) / 1000);
             }

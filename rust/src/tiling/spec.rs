@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Tile geometry: the partition of a raster into tiles and their halos.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-
 use super::{Error, Result};
 
 /// D8 neighbor offsets, `k = 1..=8` from east counterclockwise, as in the kernels.
@@ -413,12 +410,13 @@ fn morton(x: u32, y: u32) -> u64 {
     spread(x) | (spread(y) << 1)
 }
 
-/// Runs `visit` on every tile on the current Rayon pool, each tile only after
-/// its west (`tx - 1`) and north (`ty - 1`) neighbors finished, so it sees
-/// their final results: the dependency of TauDEM's row-major `dontCross`
-/// rule, which reads directions already assigned to the north and west.
-/// Tiles of a diagonal run in parallel; a tile starts as soon as its two
-/// dependencies are done rather than at a barrier.
+/// Runs `visit` on every tile, each tile only after its west (`tx - 1`) and
+/// north (`ty - 1`) neighbors finished, so it sees their final results: the
+/// dependency of TauDEM's row-major `dontCross` rule, which reads directions
+/// already assigned to the north and west. Tiles of a diagonal run in
+/// parallel on the current Rayon pool's thread count of plain threads
+/// ([`super::workers`]); a tile starts as soon as its two dependencies are
+/// done rather than at a barrier.
 ///
 /// After an error no further tile starts; the error of the first tile in
 /// row-major order that failed is returned.
@@ -427,76 +425,15 @@ where
     E: Send,
     F: Fn(TileId) -> std::result::Result<(), E> + Sync,
 {
-    let pending: Vec<AtomicU8> = spec
-        .row_major()
-        .map(|id| AtomicU8::new(u8::from(id.tx > 0) + u8::from(id.ty > 0)))
-        .collect();
-    let failed = AtomicBool::new(false);
-    let error: Mutex<Option<(TileId, E)>> = Mutex::new(None);
-    let state = Wavefront {
-        spec,
-        pending: &pending,
-        failed: &failed,
-        error: &error,
-        visit: &visit,
-    };
-    rayon::scope(|scope| state.run(scope, TileId::new(0, 0)));
-    match error.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        Some((_, error)) => Err(error),
-        None => Ok(()),
-    }
-}
-
-struct Wavefront<'a, E, F> {
-    spec: &'a TileSpec,
-    pending: &'a [AtomicU8],
-    failed: &'a AtomicBool,
-    error: &'a Mutex<Option<(TileId, E)>>,
-    visit: &'a F,
-}
-
-impl<E, F> Clone for Wavefront<'_, E, F> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<E, F> Copy for Wavefront<'_, E, F> {}
-
-impl<'a, E, F> Wavefront<'a, E, F>
-where
-    E: Send,
-    F: Fn(TileId) -> std::result::Result<(), E> + Sync,
-{
-    fn run<'s>(self, scope: &rayon::Scope<'s>, id: TileId)
-    where
-        'a: 's,
-    {
-        if self.failed.load(Ordering::Acquire) {
-            return;
-        }
-        if let Err(e) = (self.visit)(id) {
-            self.failed.store(true, Ordering::Release);
-            let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
-            if slot.as_ref().is_none_or(|(first, _)| id < *first) {
-                *slot = Some((id, e));
-            }
-            return;
-        }
-        for k in [1, 7] {
-            if let Some(next) = self.spec.neighbor(id, k)
-                && self.pending[self.spec.index(next)].fetch_sub(1, Ordering::AcqRel) == 1
-            {
-                scope.spawn(move |scope| self.run(scope, next));
-            }
-        }
-    }
+    let mut states = vec![(); super::workers::threads()];
+    super::workers::wavefront(spec, &mut states, |_, id| visit(id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn non_multiple_rasters_partition_exactly() {

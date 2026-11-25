@@ -200,6 +200,18 @@ pub fn count(name: &'static str, value: u64) {
     }
 }
 
+/// [`count`] under a name built at run time (per-pass counters). Each
+/// distinct name is kept for the rest of the process.
+pub fn count_named(name: &str, value: u64) {
+    let mut state = lock();
+    if let Some(entry) = state.counters.iter_mut().find(|(n, _)| *n == name) {
+        entry.1 += value;
+    } else {
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        state.counters.push((name, value));
+    }
+}
+
 /// Records the size of a significant working buffer in the current span.
 pub fn buffer(name: &'static str, bytes: usize) {
     let mut state = lock();

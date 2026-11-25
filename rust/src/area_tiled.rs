@@ -84,7 +84,6 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -92,7 +91,7 @@ use rayon::prelude::*;
 
 use crate::tiling::{
     BorderTable, Error, HaloWindow, Rect, Result, StoreOptions, Tier, TileCache, TileId, TileSpec,
-    TileStats, TileStore,
+    TileStats, TileStore, workers,
 };
 use crate::{DIRECTION_NODATA, DX, DY, OPPOSITE, SCALAR_NODATA, profile};
 
@@ -1392,57 +1391,15 @@ impl Worker {
     }
 }
 
-/// Runs `visit` on every item, one thread per worker's buffers, items
-/// taken in order. The threads are not Rayon's: a Rayon worker waiting on
-/// a GeoTIFF read (which terrio parallelizes) runs other queued jobs, so
-/// it would start other tiles while holding a tile's buffers. Returns the
-/// sum of `visit`'s counts, or the error of the earliest failed item.
+/// Runs `visit` on every item, one plain thread per worker's buffers
+/// ([`workers::run_with`]), items taken in order. Returns the sum of
+/// `visit`'s counts, or the error of the earliest failed item.
 fn run_tiles<T: Sync>(
     items: &[T],
-    workers: &mut [Worker],
+    buffers: &mut [Worker],
     visit: impl Fn(&mut Worker, &T) -> Result<u64> + Sync,
 ) -> Result<u64> {
-    let next = AtomicUsize::new(0);
-    let total = AtomicU64::new(0);
-    let failure: Mutex<Option<(usize, Error)>> = Mutex::new(None);
-    let failed = AtomicBool::new(false);
-    let threads = workers.len().min(items.len());
-    std::thread::scope(|scope| {
-        for worker in workers.iter_mut().take(threads) {
-            let (next, total, failure, failed, visit) = (&next, &total, &failure, &failed, &visit);
-            let spawned = std::thread::Builder::new()
-                .name("taudem-aread8".into())
-                .stack_size(8 << 20)
-                .spawn_scoped(scope, move || {
-                    while !failed.load(Relaxed) {
-                        let i = next.fetch_add(1, Relaxed);
-                        let Some(item) = items.get(i) else { break };
-                        match visit(worker, item) {
-                            Ok(count) => {
-                                total.fetch_add(count, Relaxed);
-                            }
-                            Err(error) => {
-                                failed.store(true, Relaxed);
-                                let mut slot = failure.lock().unwrap_or_else(|p| p.into_inner());
-                                if slot.as_ref().is_none_or(|(j, _)| i < *j) {
-                                    *slot = Some((i, error));
-                                }
-                            }
-                        }
-                    }
-                });
-            if let Err(error) = spawned {
-                failed.store(true, Relaxed);
-                let mut slot = failure.lock().unwrap_or_else(|p| p.into_inner());
-                slot.get_or_insert((usize::MAX, Error::Io(error)));
-                break;
-            }
-        }
-    });
-    match failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        Some((_, error)) => Err(error),
-        None => Ok(total.into_inner()),
-    }
+    workers::run_with(buffers, items.len(), |worker, i| visit(worker, &items[i]))
 }
 
 /// Receives a tile's final areas: its core rectangle, row-major.
@@ -1458,7 +1415,7 @@ pub fn area_d8_tiled(
     sink: &AreaSink<'_>,
 ) -> Result<TiledAreaStats> {
     let workers = if options.workers == 0 {
-        rayon::current_num_threads()
+        workers::threads()
     } else {
         options.workers
     };
