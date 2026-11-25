@@ -22,9 +22,12 @@ All inputs and outputs are GeoTIFF. The first band is used. Output nodata
 values are `-3e38` for Float32 fel, `-32768` for Int16 p, and `-1` for Float32
 sd8 and ad8. D8 direction is 1 east, increasing counterclockwise.
 Slope is measured on the original filled surface before flat routing.
-Output uses tiled Deflate with automatic BigTIFF selection. For trusted inputs
-with a single decoded TIFF strip larger than 256 MiB, set
-`TERRIO_TIFF_MAX_CHUNK_BYTES` to at least that strip's decoded byte size.
+Output uses tiled Deflate with automatic BigTIFF selection. Float32 DEMs use
+Terrio's caller-buffer read when the source and codec support it. For a strip
+over Terrio's 256 MiB decoded-chunk limit, TauDEM requests smaller windows and
+uses Terrio's row-based decoder when available. Compressed strips may be
+decoded from the start for each window. For trusted inputs that still hit the
+limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.

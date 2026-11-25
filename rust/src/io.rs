@@ -5,8 +5,8 @@ use std::{error::Error, path::Path};
 use taudem_rs::{DIRECTION_NODATA, Grid, INVALID_DIRECTION};
 use terrio::raster::RasterData;
 use terrio::{
-    DataType, GeoTiffWriter, LazyRaster, RasterDataset, RasterWriteOptions, Window, WindowOptions,
-    open_raster_lazy,
+    DataType, Error as TerrioError, GeoTiffWriter, LazyRaster, RasterDataset, RasterWriteOptions,
+    TiffReadLimits, Window, WindowOptions, open_raster_lazy,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -93,27 +93,50 @@ impl Raster {
         Ok(())
     }
 
-    // Terrio returns owned, typed window buffers. Aligning reads to source
-    // blocks bounds temporary pixels without decoding a block twice.
+    // Conversions and unsupported direct reads use native window buffers.
+    // Keep windows block-aligned except when Terrio needs to read a large strip by rows.
     fn read_stripes(&mut self, mut append: impl FnMut(RasterData)) -> Result<()> {
         let width = self.input.width();
         let height = self.input.height();
-        let block = self.input.block_size().map_or(1, |(_, rows)| rows);
+        let (block_width, block) = self.input.block_size().unwrap_or((width, 1));
         let row_bytes = width * self.input.data_type().size_bytes();
         let target_rows = (STRIPE_BYTES / row_bytes / block).max(1) * block;
+        let limit = TiffReadLimits::from_config()?.chunk_bytes;
+        let strip_rows = limit / row_bytes / self.input.band_count();
         let options = WindowOptions {
             bands: vec![1],
             ..Default::default()
         };
-        for y in (0..height).step_by(target_rows) {
-            let window = Window::new(0, y, width, (height - y).min(target_rows));
+        let mut y = 0;
+        while y < height {
+            let mut rows = (height - y).min(target_rows);
+            if block_width == width && (1..block.min(height)).contains(&strip_rows) {
+                rows = rows.min(strip_rows).min(block - y % block);
+            }
+            let window = Window::new(0, y, width, rows);
             append(self.input.read_geotiff_samples(window, &options)?);
+            y += rows;
         }
         Ok(())
     }
 
     pub fn elevations(&mut self) -> Result<Vec<f32>> {
-        let cells = self.input.width() * self.input.height();
+        let (width, height) = (self.input.width(), self.input.height());
+        let cells = width * height;
+        if self.input.band_data_type(1) == DataType::F32 {
+            let mut elevations = vec![0.0f32; cells];
+            match self.input.read_geotiff_samples_into(
+                Window::new(0, 0, width, height),
+                1,
+                None,
+                &mut elevations,
+            ) {
+                Ok(()) => return Ok(elevations),
+                Err(TerrioError::Unsupported(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
         let mut elevations = Vec::new();
         self.read_stripes(|stripe| match stripe {
             RasterData::F32(data) if data.len() == cells => elevations = data,
@@ -191,28 +214,28 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
         ..Default::default()
     };
     let mut writer = GeoTiffWriter::create(path, &header, &options)?;
-    let mut stripe = RasterData::new_filled(data_type, 0, 0.0);
-    for y in (0..rows).step_by(TILE) {
-        let height = (rows - y).min(TILE);
-        let range = y * width..(y + height) * width;
-        match (&product, &mut stripe) {
-            (Product::Float(values, _), RasterData::F32(target)) => {
-                target.clear();
-                target.extend_from_slice(&values[range]);
+    match product {
+        Product::Float(values, _) => {
+            for stripe in values.chunks(width * TILE) {
+                writer.write_rows_slice(stripe, stripe.len() / width, None)?;
             }
-            (Product::Direction(values), RasterData::I16(target)) => {
-                target.clear();
-                target.extend(values[range].iter().map(|&code| {
+        }
+        Product::Direction(values) => {
+            // The kernels store byte directions. Convert to TauDEM's Int16
+            // file representation one block row at a time.
+            let mut stripe = Vec::with_capacity(width * rows.min(TILE));
+            for directions in values.chunks(width * TILE) {
+                stripe.clear();
+                stripe.extend(directions.iter().map(|&code| {
                     if code == DIRECTION_NODATA {
                         P_NODATA
                     } else {
                         i16::from(code)
                     }
                 }));
+                writer.write_rows_slice(&stripe, directions.len() / width, None)?;
             }
-            _ => unreachable!(),
         }
-        writer.write_rows(&stripe, height, None)?;
     }
     writer.finish()?;
     Ok(())

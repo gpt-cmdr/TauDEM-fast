@@ -7,4 +7,4 @@ license = "GPL-3.0-only"
 
 [dependencies]
 rayon = "1.12"
-terrio = { git = "https://github.com/CLB-Engineering-Corporation/terrio", branch = "main", default-features = false, features = ["geotiff"] }
+terrio = { git = "https://github.com/CLB-Engineering-Corporation/terrio", branch = "taudem-integration", default-features = false, features = ["geotiff"] }
