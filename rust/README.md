@@ -39,9 +39,12 @@ limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
 BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
 of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
-the system temporary directory). Tiled, out-of-core execution is not
-implemented yet: `--mode tiled` stops with an error, and `auto` and
-`in-memory` run in memory as before. The library's `tiling` module holds its
+the system temporary directory). Tiled, out-of-core execution exists for
+`d8flowdir`: `--mode tiled` runs it within `--max-memory`, and `auto` runs
+it tiled when the in-memory estimate (about 10 bytes per cell) exceeds the
+budget or the raster exceeds the in-memory cell limit; its outputs are
+identical to the in-memory ones. For the other subcommands `--mode tiled`
+stops with an error and `auto` runs in memory. The library's `tiling` module holds its
 infrastructure (tile geometry, a three-tier tile store under a memory
 budget, tile border tables, and a background GeoTIFF tile writer); see
 `docs/rust-port/STREAMING.md` section 3.
@@ -49,7 +52,7 @@ budget, tile border tables, and a background GeoTIFF tile writer); see
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and out-of-core processing are future work.
+directions (`-sfdr`), and out-of-core PitRemove and AreaD8 are future work.
 
 ## Memory and threads
 
@@ -91,6 +94,12 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
   AreaD8 walks downstream from headwater cells in parallel; the walk that
   completes a cell's last upstream neighbor sums it, adding upstream areas in
   TauDEM's fixed neighbor order, so the sums are identical for any schedule.
+- Tiled D8FlowDir (`d8_tiled`) routes each tile's flats that stay inside it
+  in the tile, and the flats that reach a tile edge pass by pass across
+  tiles: TauDEM's two increment fields are completed by label-correcting
+  relaxation over tile perimeters, and every pass uses the raster-wide
+  highest levels the in-memory resolver uses. The module documentation and
+  `docs/rust-port/STREAMING.md` section 2.3 give the exactness argument.
 
 ## Tests for tiled stages
 
