@@ -1,0 +1,22 @@
+# Datasets and outputs live outside the repo (TAUDEM_BENCH_WORK / TAUDEM_TEST_DATA).
+# Guard against accidental writes here.
+*.tif
+*.tiff
+*.img
+*.bil
+*.bin
+*.sdat
+*.sgrd
+*.hdr
+*.aux.xml
+*.vrt
+*.jsonl
+*.csv
+results/
+work/
+data/
+TauDEM-Test-Data/
+__pycache__/
+*.pyc
+.venv/
+uv.lock

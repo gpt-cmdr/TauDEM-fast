@@ -1,0 +1,96 @@
+{
+  "_comment": "Parity cases transcribed from TauDEM-Test-Data/Input/testall.bat. Each case copies Input/<folder> to a scratch dir and runs its steps in order. ref_inputs are files a step consumes that an earlier step produces: with --inputs reference (default) they are first overwritten from ReferenceResult/<folder>, so one tool's mismatch cannot cascade; with --inputs chain the produced file is used. outputs are compared with ReferenceResult/<folder>/<name>; an entry may be an object {name, atol, rtol} to override tolerances. tags allow filtering with --tags / --skip-tags.",
+  "cases": {
+    "Base": {
+      "folder": "Base",
+      "steps": [
+        {"id": "pitremove-positional", "tool": "pitremove", "np": 3, "argv": ["logan.tif"], "outputs": ["loganfel.tif"], "tags": ["positional"]},
+        {"id": "pitremove-explicit", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel.tif"], "outputs": ["loganfel.tif"], "tags": ["explicit"]},
+        {"id": "pitremove-4way", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel4.tiff", "-4way"], "outputs": ["loganfel4.tiff"], "tags": ["4way"]},
+        {"id": "pitremove-depmask", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfeldm.tif", "-depmask", "logpitmask.tif"], "outputs": ["loganfeldm.tif"], "tags": ["depmask"]},
+        {"id": "pitremove-depmask-4way", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfeldm4.tif", "-depmask", "logpitmask.tif", "-4way"], "outputs": ["loganfeldm4.tif"], "tags": ["depmask", "4way"]},
+        {"id": "d8flowdir-fel", "tool": "d8flowdir", "np": 5, "argv": ["-p", "loganp.tif", "-sd8", "logansd8.tif", "-fel", "loganfel.tif"], "ref_inputs": ["loganfel.tif"], "outputs": ["loganp.tif", "logansd8.tif"]},
+        {"id": "d8flowdir-nofill", "tool": "d8flowdir", "np": 6, "argv": ["-p", "loganpnf.tif", "-sd8", "logansd8nf.tif", "-fel", "logan.tif"], "outputs": ["loganpnf.tif", "logansd8nf.tif"]},
+        {"id": "aread8-positional", "tool": "aread8", "np": 4, "argv": ["logan.tif"], "ref_inputs": ["loganp.tif"], "outputs": ["loganad8.tif"], "tags": ["positional"]},
+        {"id": "aread8-explicit", "tool": "aread8", "np": 4, "argv": ["-p", "loganp.tif", "-ad8", "loganad8.tif"], "ref_inputs": ["loganp.tif"], "outputs": ["loganad8.tif"], "tags": ["explicit"]},
+        {"id": "aread8-nofill", "tool": "aread8", "np": 4, "argv": ["-p", "loganpnf.tif", "-ad8", "loganad8nf.tif"], "ref_inputs": ["loganpnf.tif"], "outputs": ["loganad8nf.tif"]},
+        {"id": "aread8-outlet", "tool": "aread8", "np": 7, "argv": ["-p", "loganp.tif", "-o", "Outlet.shp", "-ad8", "loganad8o.tif"], "ref_inputs": ["loganp.tif"], "outputs": ["loganad8o.tif"], "tags": ["ogr"]},
+        {"id": "pitremove-int16-lzw", "tool": "pitremove", "np": 8, "argv": ["MED_01_01.tif"], "outputs": ["MED_01_01fel.tif"], "tags": ["positional", "int16"]},
+        {"id": "pitremove-int16-lzw-explicit", "tool": "pitremove", "np": 8, "argv": ["-z", "MED_01_01.tif", "-fel", "MED_01_01fel.tif"], "outputs": ["MED_01_01fel.tif"], "tags": ["explicit", "int16"]},
+        {"id": "pitremove-vrt", "tool": "pitremove", "np": 8, "argv": ["-z", "LoganVRT/output.vrt", "-fel", "loganvrtfel.tif"], "outputs": ["loganvrtfel.tif"], "tags": ["formats"]},
+        {"id": "pitremove-img", "tool": "pitremove", "np": 8, "argv": ["-z", "loganIMG/logan.img", "-fel", "loganimgfel.tif"], "outputs": ["loganimgfel.tif"], "tags": ["formats"]},
+        {"id": "pitremove-esrigrid", "tool": "pitremove", "np": 8, "argv": ["-z", "loganESRIGRID/logan", "-fel", "loganesrigridfel.tif"], "outputs": ["loganesrigridfel.tif"], "tags": ["formats"]}
+      ]
+    },
+    "fts": {
+      "folder": "fts",
+      "steps": [
+        {"id": "pitremove", "tool": "pitremove", "np": 3, "argv": ["fs_small.tif"], "outputs": ["fs_smallfel.tif"], "tags": ["positional"]},
+        {"id": "pitremove-explicit", "tool": "pitremove", "np": 3, "argv": ["-z", "fs_small.tif", "-fel", "fs_smallfel.tif"], "outputs": ["fs_smallfel.tif"], "tags": ["explicit"]},
+        {"id": "d8flowdir", "tool": "d8flowdir", "np": 4, "argv": ["fs_small.tif"], "ref_inputs": ["fs_smallfel.tif"], "outputs": ["fs_smallp.tif", "fs_smallsd8.tif"], "tags": ["positional"]},
+        {"id": "d8flowdir-explicit", "tool": "d8flowdir", "np": 4, "argv": ["-fel", "fs_smallfel.tif", "-p", "fs_smallp.tif", "-sd8", "fs_smallsd8.tif"], "ref_inputs": ["fs_smallfel.tif"], "outputs": ["fs_smallp.tif", "fs_smallsd8.tif"], "tags": ["explicit"]},
+        {"id": "aread8", "tool": "aread8", "np": 1, "argv": ["fs_small.tif"], "ref_inputs": ["fs_smallp.tif"], "outputs": ["fs_smallad8.tif"], "tags": ["positional"]}
+        ,{"id": "aread8-explicit", "tool": "aread8", "np": 1, "argv": ["-p", "fs_smallp.tif", "-ad8", "fs_smallad8.tif"], "ref_inputs": ["fs_smallp.tif"], "outputs": ["fs_smallad8.tif"], "tags": ["explicit"]}
+      ]
+    },
+    "Geographic": {
+      "folder": "Geographic",
+      "steps": [
+        {"id": "pitremove", "tool": "pitremove", "np": 3, "argv": ["enogeo.tif"], "outputs": ["enogeofel.tif"], "tags": ["positional", "geographic"]},
+        {"id": "pitremove-explicit", "tool": "pitremove", "np": 3, "argv": ["-z", "enogeo.tif", "-fel", "enogeofel.tif"], "outputs": ["enogeofel.tif"], "tags": ["explicit", "geographic"]},
+        {"id": "d8flowdir", "tool": "d8flowdir", "np": 5, "argv": ["-p", "enogeop.tif", "-sd8", "enogeosd8.tif", "-fel", "enogeofel.tif"], "ref_inputs": ["enogeofel.tif"], "outputs": ["enogeop.tif", "enogeosd8.tif"], "tags": ["geographic"]},
+        {"id": "aread8-positional", "tool": "aread8", "np": 4, "argv": ["enogeo.tif"], "ref_inputs": ["enogeop.tif"], "outputs": ["enogeoad8.tif"], "tags": ["positional", "geographic"]},
+        {"id": "aread8-explicit", "tool": "aread8", "np": 4, "argv": ["-p", "enogeop.tif", "-ad8", "enogeoad8.tif"], "ref_inputs": ["enogeop.tif"], "outputs": ["enogeoad8.tif"], "tags": ["explicit", "geographic"]},
+        {"id": "aread8-outlets", "tool": "aread8", "np": 7, "argv": ["-p", "enogeop.tif", "-o", "Outlets.shp", "-ad8", "enogeoad8o.tif"], "ref_inputs": ["enogeop.tif"], "outputs": ["enogeoad8o.tif"], "tags": ["ogr", "geographic"]}
+      ]
+    },
+    "gridtypes": {
+      "folder": "gridtypes",
+      "steps": [
+        {"id": "pitremove-tif", "tool": "pitremove", "np": 3, "argv": ["logan.tif"], "outputs": ["loganfel.tif"], "tags": ["positional"]},
+        {"id": "pitremove-img", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfelim.img"], "outputs": ["loganfelim.img"], "tags": ["formats"]},
+        {"id": "pitremove-sdat", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfelsd.sdat"], "outputs": ["loganfelsd.sdat"], "tags": ["formats"]},
+        {"id": "pitremove-bil", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel.bil"], "outputs": ["loganfel.bil"], "tags": ["formats"]},
+        {"id": "pitremove-bin", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel1.bin"], "outputs": ["loganfel1.bin"], "tags": ["formats"]},
+        {"id": "d8flowdir-bin-bil", "tool": "d8flowdir", "np": 3, "argv": ["-fel", "loganfel1.bin", "-p", "bilp.bil", "-sd8", "binsd8.bin"], "ref_inputs": ["loganfel1.bin"], "outputs": ["bilp.bil", "binsd8.bin"], "tags": ["formats"]},
+        {"id": "aread8-bil-img", "tool": "aread8", "np": 5, "argv": ["-p", "bilp.bil", "-ad8", "loganad8.img"], "ref_inputs": ["bilp.bil"], "outputs": ["loganad8.img"], "tags": ["formats"]},
+        {"id": "pitremove-unknown-ext", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel2.lg"], "outputs": ["loganfel2.tif"], "tags": ["formats"]},
+        {"id": "pitremove-no-ext", "tool": "pitremove", "np": 3, "argv": ["-z", "logan.tif", "-fel", "loganfel3"], "outputs": ["loganfel3.tif"], "tags": ["formats"]}
+      ]
+    },
+    "AreaD8_data": {
+      "folder": "AreaD8_data",
+      "steps": [
+        {"id": "outlet-shp", "tool": "aread8", "np": 7, "argv": ["-p", "loganp.tif", "-o", "LoganOutlet.shp", "-ad8", "loganad8_1.tif"], "outputs": ["loganad8_1.tif"], "tags": ["ogr"]},
+        {"id": "outlet-sqlite-lyrname", "tool": "aread8", "np": 3, "argv": ["-p", "loganp.tif", "-o", "LoganSample.sqlite", "-lyrname", "LoganOutlet", "-ad8", "loganad8_3.tif"], "outputs": ["loganad8_3.tif"], "tags": ["ogr"]},
+        {"id": "outlet-json", "tool": "aread8", "np": 4, "argv": ["-p", "loganp.tif", "-o", "LoganOutlet.json", "-ad8", "loganad8_4.tif"], "outputs": ["loganad8_4.tif"], "tags": ["ogr"]},
+        {"id": "outlet-json-lyrname", "tool": "aread8", "np": 6, "argv": ["-p", "loganp.tif", "-o", "LoganOutlet.json", "-lyrname", "LoganOutlet", "-ad8", "loganad8_5.tif"], "outputs": ["loganad8_5.tif"], "tags": ["ogr"]},
+        {"id": "outlet-gdb", "tool": "aread8", "np": 7, "argv": ["-p", "loganp.tif", "-o", "Logan.gdb", "-ad8", "loganad8_6.tif"], "outputs": ["loganad8_6.tif"], "tags": ["ogr", "filegdb"]},
+        {"id": "outlet-gdb-lyrname", "tool": "aread8", "np": 5, "argv": ["-p", "loganp.tif", "-o", "Logan.gdb", "-lyrname", "Outlet", "-ad8", "loganad8_7.tif"], "outputs": ["loganad8_7.tif"], "tags": ["ogr", "filegdb"]},
+        {"id": "outlet-gdb-lyrno", "tool": "aread8", "np": 2, "argv": ["-p", "loganp.tif", "-o", "Logan.gdb", "-lyrno", "0", "-ad8", "loganad8_8.tif"], "outputs": ["loganad8_8.tif"], "tags": ["ogr", "filegdb"]}
+      ]
+    },
+    "D8flowextreme": {
+      "folder": "D8flowextreme",
+      "steps": [
+        {"id": "shp", "tool": "d8flowpathextremeup", "np": 3, "argv": ["-p", "loganp.tif", "-sa", "logansa.tif", "-ssa", "loganssa1.tif", "-o", "LoganOutlet.shp"], "outputs": ["loganssa1.tif"], "tags": ["ogr"]},
+        {"id": "sqlite-lyrname", "tool": "d8flowpathextremeup", "np": 5, "argv": ["-p", "loganp.tif", "-sa", "logansa.tif", "-ssa", "loganssa2.tif", "-o", "LoganSample.sqlite", "-lyrname", "LoganOutlet"], "outputs": ["loganssa2.tif"], "tags": ["ogr"]},
+        {"id": "sqlite-lyrno", "tool": "d8flowpathextremeup", "np": 7, "argv": ["-p", "loganp.tif", "-sa", "logansa.tif", "-ssa", "loganssa3.tif", "-o", "LoganSample.sqlite", "-lyrno", "1"], "outputs": ["loganssa3.tif"], "tags": ["ogr"]},
+        {"id": "gdb", "tool": "d8flowpathextremeup", "np": 1, "argv": ["-p", "loganp.tif", "-sa", "logansa.tif", "-ssa", "loganssa4.tif", "-o", "Logan.gdb"], "outputs": ["loganssa4.tif"], "tags": ["ogr", "filegdb"]},
+        {"id": "gdb-lyrno", "tool": "d8flowpathextremeup", "np": 8, "argv": ["-p", "loganp.tif", "-sa", "logansa.tif", "-ssa", "loganssa5.tif", "-o", "Logan.gdb", "-lyrno", "0"], "outputs": ["loganssa5.tif"], "tags": ["ogr", "filegdb"]}
+      ]
+    },
+    "GDAL_unset_nodata": {
+      "folder": "GDAL_unset_nodata",
+      "steps": [
+        {"id": "aread8-weights-nc", "tool": "aread8", "np": 4, "argv": ["-p", "p.tif", "-ad8", "ssa.tif", "-wg", "weights.tif", "-nc"], "outputs": ["ssa.tif"], "tags": ["weights", "nodata"]}
+      ]
+    },
+    "NoEPSG": {
+      "folder": "NoEPSG",
+      "steps": [
+        {"id": "aread8-outlet-nc", "tool": "aread8", "np": 2, "argv": ["-p", "ma2_ep.tif", "-ad8", "ma2_ead8.tif", "-o", "outlet.shp", "-nc"], "outputs": ["ma2_ead8.tif"], "tags": ["ogr", "crs"]}
+      ]
+    }
+  }
+}

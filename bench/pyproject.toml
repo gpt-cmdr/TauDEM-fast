@@ -1,0 +1,16 @@
+[project]
+name = "taudem-bench"
+version = "0.1.0"
+description = "Parity and benchmark harness for TauDEM (C++) and taudem-rs"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "rasterio>=1.3",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+
+[tool.uv]
+package = false

@@ -1,0 +1,23 @@
+{
+  "_comment": "Canonical tool name -> executable per implementation. cpp = C++ TauDEM executable stem (resolved case-insensitively, with or without .exe). rs = taudem-rs subcommand; null = not implemented yet, so parity steps using it are SKIPPED for rs. When taudem-rs gains a tool, set its subcommand here and the matching parity cases start running.",
+  "tools": {
+    "pitremove":           {"cpp": "PitRemove",           "rs": "pitremove"},
+    "d8flowdir":           {"cpp": "D8FlowDir",           "rs": "d8flowdir"},
+    "aread8":              {"cpp": "AreaD8",              "rs": "aread8"},
+    "dinfflowdir":         {"cpp": "DinfFlowDir",         "rs": null},
+    "areadinf":            {"cpp": "AreaDinf",            "rs": null},
+    "d8flowpathextremeup": {"cpp": "D8FlowPathExtremeUp", "rs": null},
+    "threshold":           {"cpp": "Threshold",           "rs": null},
+    "gridnet":             {"cpp": "GridNet",             "rs": null}
+  },
+  "rs": {
+    "_comment": "How a rank count maps to taudem-rs parallelism. threads_flag, when set, is appended as '<flag> N'; threads_env, when set, is exported as N. Set both to null to ignore ranks for rs.",
+    "threads_flag": null,
+    "threads_env": "RAYON_NUM_THREADS",
+    "pipeline": {
+      "_comment": "Fused pitremove -> d8flowdir -> aread8. {dem} {fel} {p} {sd8} {ad8} are substituted.",
+      "subcommand": "pipeline",
+      "argv": ["-z", "{dem}", "-fel", "{fel}", "-p", "{p}", "-sd8", "{sd8}", "-ad8", "{ad8}"]
+    }
+  }
+}
