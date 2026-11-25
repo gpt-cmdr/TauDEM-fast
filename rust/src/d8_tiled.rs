@@ -224,6 +224,9 @@ pub fn tile_size_for_budget(budget: u64, threads: usize, ceiling: usize) -> usiz
     (side / 256 * 256).clamp(256, ceiling.max(256))
 }
 
+/// The highest fall or rise level a packed level word holds.
+const NARROW_LEVEL: u32 = u16::MAX as u32;
+
 const INTERIOR: u8 = 1;
 const DEFERRED: u8 = 2;
 
@@ -571,6 +574,10 @@ struct Layers {
     dir: TileStore<u8>,
     elev: TileStore<f32>,
     adj: TileStore<u16>,
+    /// Fall and rise levels in the low and high halves of one word, for
+    /// tiles whose levels fit 16 bits.
+    levels: TileStore<u32>,
+    /// Both levels in full for the other tiles.
     fall: TileStore<u32>,
     rise: TileStore<u32>,
 }
@@ -618,6 +625,8 @@ pub struct TiledD8 {
     tile_max: Vec<AtomicU64>,
     /// The highest fall and rise levels of interior components, per pass.
     interior: Mutex<Vec<[u32; 2]>>,
+    /// The highest level stored packed ([`NARROW_LEVEL`]; lower in tests).
+    narrow: u32,
     crossing: AtomicBool,
     scratch: Mutex<Vec<Scratch>>,
     counters: Counters,
@@ -648,6 +657,7 @@ impl TiledD8 {
                 dir: cache.store("d8.dir", StoreOptions::default()),
                 elev: cache.store("d8.elev", StoreOptions::default()),
                 adj: cache.store("d8.adj", StoreOptions::default()),
+                levels: cache.store("d8.levels", StoreOptions::default()),
                 fall: cache.store("d8.fall", StoreOptions::default()),
                 rise: cache.store("d8.rise", StoreOptions::default()),
             },
@@ -656,6 +666,7 @@ impl TiledD8 {
             deferred: (0..tiles).map(|_| AtomicU64::new(0)).collect(),
             tile_max: (0..tiles).map(|_| AtomicU64::new(0)).collect(),
             interior: Mutex::new(Vec::new()),
+            narrow: NARROW_LEVEL,
             crossing: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
             counters: Counters::default(),
@@ -792,13 +803,46 @@ impl TiledD8 {
         self.layers.dir.put_owned(id, dirs)?;
         self.layers.elev.put(id, fel)?;
         self.layers.adj.put_owned(id, adj)?;
-        self.layers
-            .fall
-            .put_owned(id, std::mem::take(&mut s.fall))?;
-        self.layers
-            .rise
-            .put_owned(id, std::mem::take(&mut s.rise))?;
+        self.put_levels(id, std::mem::take(&mut s.fall), &s.rise)?;
         Ok(())
+    }
+
+    /// Stores a tile's levels, packed when both fit [`Self::narrow`].
+    fn put_levels(&self, id: TileId, mut fall: Vec<u32>, rise: &[u32]) -> Result<()> {
+        let limit = self.narrow;
+        if fall.iter().zip(rise).all(|(&f, &r)| f.max(r) <= limit) {
+            for (f, &r) in fall.iter_mut().zip(rise) {
+                *f |= r << 16;
+            }
+            self.layers.levels.put_owned(id, fall)
+        } else {
+            self.layers.fall.put_owned(id, fall)?;
+            self.layers.rise.put(id, rise)
+        }
+    }
+
+    /// Takes a tile's levels out of the store: returns the fall levels and
+    /// fills `rise`.
+    fn take_levels(&self, id: TileId, rise: &mut Vec<u32>) -> Result<Vec<u32>> {
+        if let Some(mut fall) = self.layers.levels.take(id)? {
+            rise.clear();
+            rise.extend(fall.iter().map(|&w| w >> 16));
+            for w in &mut fall {
+                *w &= 0xFFFF;
+            }
+            return Ok(fall);
+        }
+        let fall = self
+            .layers
+            .fall
+            .take(id)?
+            .ok_or_else(|| missing_tile(id, "levels"))?;
+        *rise = self
+            .layers
+            .rise
+            .take(id)?
+            .ok_or_else(|| missing_tile(id, "rise"))?;
+        Ok(fall)
     }
 
     /// Steepest-descent directions without the crossing rule.
@@ -1250,14 +1294,8 @@ impl TiledD8 {
             .adj
             .take(id)?
             .ok_or_else(|| missing_tile(id, "adj"))?;
-        let mut fall = layers
-            .fall
-            .take(id)?
-            .ok_or_else(|| missing_tile(id, "fall"))?;
-        let mut rise = layers
-            .rise
-            .take(id)?
-            .ok_or_else(|| missing_tile(id, "rise"))?;
+        let mut rise = std::mem::take(&mut s.rise);
+        let mut fall = self.take_levels(id, &mut rise)?;
         for &(v, i) in s.seeds.iter() {
             fall[i as usize] = v;
         }
@@ -1288,8 +1326,8 @@ impl TiledD8 {
         let changed = *tables.fall.read(id) != fall_around.border
             || *tables.rise.read(id) != rise_around.border;
         layers.adj.put_owned(id, adj)?;
-        layers.fall.put_owned(id, fall)?;
-        layers.rise.put_owned(id, rise)?;
+        self.put_levels(id, fall, &rise)?;
+        s.rise = rise;
         if changed {
             for k in 1..=8 {
                 if let Some(n) = self.spec.neighbor(id, k) {
@@ -1325,21 +1363,15 @@ impl TiledD8 {
             .elev
             .take(id)?
             .ok_or_else(|| missing_tile(id, "elev"))?;
-        let mut fall = layers
-            .fall
-            .take(id)?
-            .ok_or_else(|| missing_tile(id, "fall"))?;
-        let mut rise = layers
-            .rise
-            .take(id)?
-            .ok_or_else(|| missing_tile(id, "rise"))?;
+        let mut s = self.scratch();
+        let s = &mut *s;
+        let mut rise = std::mem::take(&mut s.rise);
+        let mut fall = self.take_levels(id, &mut rise)?;
         layers.adj.remove(id);
         tables.fall.fill_halo_ring(id, &halo, &mut fall, 0)?;
         tables.rise.fill_halo_ring(id, &halo, &mut rise, 0)?;
         tables.elev.fill_halo_ring(id, &halo, &mut elev, f32::NAN)?;
 
-        let mut s = self.scratch();
-        let s = &mut *s;
         let Constants {
             unresolved,
             last_rise,
@@ -1380,6 +1412,7 @@ impl TiledD8 {
         next.elev.set_from_halo(id, &halo, &elev)?;
         self.deferred[self.spec.index(id)].store(remaining, Relaxed);
         if remaining == 0 {
+            s.rise = rise;
             halo.core_from_buffer(&dirs, &mut s.core)?;
             return finished(id, &s.core).map(|()| 0);
         }
@@ -1396,8 +1429,7 @@ impl TiledD8 {
         layers.dir.put_owned(id, dirs)?;
         layers.elev.put_owned(id, elev)?;
         layers.adj.put_owned(id, adj)?;
-        layers.fall.put_owned(id, std::mem::take(&mut s.fall))?;
-        layers.rise.put_owned(id, std::mem::take(&mut s.rise))?;
+        self.put_levels(id, std::mem::take(&mut s.fall), &s.rise)?;
         Ok(remaining)
     }
 }
@@ -2028,4 +2060,76 @@ pub fn d8_flow_tiled(
     }
     drop(pool);
     d8.finish(direction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiling::CacheConfig;
+    use crate::{FEL_NODATA, Grid, d8_flow};
+
+    /// Tiled D8 with levels above `narrow` stored unpacked.
+    fn tiled(spec: TileSpec, z: &[f32], narrow: u32) -> Vec<u8> {
+        let cache = TileCache::new(CacheConfig::new(1 << 30, None));
+        let mut d8 = TiledD8::new(
+            spec,
+            FEL_NODATA,
+            &[(1.0, 1.0)],
+            &cache,
+            SteepSchedule::Parallel,
+        )
+        .unwrap();
+        d8.narrow = narrow;
+        let width = spec.raster_width();
+        let out = Mutex::new(vec![0u8; z.len()]);
+        let place = |id: TileId, data: &[u8]| {
+            let r = spec.rect(id);
+            let mut out = out.lock().unwrap();
+            for row in 0..r.height {
+                let at = (r.y + row) * width + r.x;
+                out[at..at + r.width].copy_from_slice(&data[row * r.width..(row + 1) * r.width]);
+            }
+            Ok(())
+        };
+        let mut buffer = Vec::new();
+        for id in spec.row_major() {
+            halo_from_grid(&spec, id, z, f32::NAN, &mut buffer).unwrap();
+            d8.process_tile(id, &buffer, None, |d| place(id, d))
+                .unwrap();
+        }
+        assert!(matches!(d8.finish(&place).unwrap(), D8Outcome::Done(_)));
+        out.into_inner().unwrap()
+    }
+
+    #[test]
+    fn unpacked_levels_match() {
+        // A walled plateau drained on its west side, with an island: levels
+        // far above the forced limit, ties needing later passes.
+        let (w, h) = (97, 61);
+        let mut z = vec![60.0f32; w * h];
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                z[y * w + x] = 50.0;
+            }
+        }
+        for y in 20..30 {
+            for x in 40..47 {
+                z[y * w + x] = 55.0;
+            }
+        }
+        z[(h / 2) * w + 1] = 40.0;
+        z[(h / 2) * w] = 30.0;
+        let expected = d8_flow(
+            Grid::new(w, h).unwrap(),
+            &z,
+            FEL_NODATA,
+            &[(1.0, 1.0)],
+            false,
+        );
+        for t in [16, 23] {
+            let spec = TileSpec::new(w, h, t, t).unwrap();
+            assert_eq!(tiled(spec, &z, 7), expected.direction, "T={t}, wide");
+            assert_eq!(tiled(spec, &z, NARROW_LEVEL), expected.direction, "T={t}");
+        }
+    }
 }
