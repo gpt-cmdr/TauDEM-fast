@@ -7,6 +7,7 @@ pub mod area_tiled;
 mod d8;
 pub mod d8_tiled;
 mod flood;
+pub mod pipeline_tiled;
 pub mod pitremove_tiled;
 pub mod profile;
 pub mod tiling;
