@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 
-use crate::{DIRECTION_NODATA, Grid, OPPOSITE, SCALAR_NODATA};
+use crate::{DIRECTION_NODATA, Grid, OPPOSITE, SCALAR_NODATA, profile};
 
 const CONTAMINATED: u8 = 16;
 const INACTIVE: u8 = 32;
@@ -11,7 +11,9 @@ const INACTIVE: u8 = 32;
 /// directions use 1–8, 0 for unresolved flow and 255 for nodata.
 pub fn area_d8(grid: Grid, direction: &[u8], check_contamination: bool) -> Vec<f32> {
     assert_eq!(direction.len(), grid.cells);
+    let indegree = profile::span("area.indegree");
     let mut state = vec![INACTIVE; grid.cells];
+    profile::buffer("area.state", state.len());
     state
         .par_chunks_mut(grid.width)
         .enumerate()
@@ -31,7 +33,10 @@ pub fn area_d8(grid: Grid, direction: &[u8], check_contamination: bool) -> Vec<f
                 *cell = incoming | (u8::from(check_contamination && contaminated) * CONTAMINATED);
             }
         });
+    drop(indegree);
+    let _traverse = profile::span("area.traverse");
     let mut area = vec![SCALAR_NODATA; grid.cells];
+    profile::buffer("area.area", area.len() * 4);
     for start in 0..grid.cells {
         let mut i = start;
         // There is only one downstream edge. Follow it immediately whenever

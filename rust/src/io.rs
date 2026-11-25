@@ -224,7 +224,9 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
             // The kernels store byte directions. Convert to TauDEM's Int16
             // file representation one block row at a time.
             let mut stripe = Vec::with_capacity(width * rows.min(TILE));
+            let mut converting = std::time::Duration::ZERO;
             for directions in values.chunks(width * TILE) {
+                let start = std::time::Instant::now();
                 stripe.clear();
                 stripe.extend(directions.iter().map(|&code| {
                     if code == DIRECTION_NODATA {
@@ -233,8 +235,10 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
                         i16::from(code)
                     }
                 }));
+                converting += start.elapsed();
                 writer.write_rows_slice(&stripe, directions.len() / width, None)?;
             }
+            taudem_rs::profile::count("write.p.convert_us", converting.as_micros() as u64);
         }
     }
     writer.finish()?;

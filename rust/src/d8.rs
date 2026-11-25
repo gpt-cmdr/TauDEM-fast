@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use rayon::prelude::*;
 
-use crate::{DIRECTION_NODATA, Grid, ORDER, SCALAR_NODATA, missing};
+use crate::{DIRECTION_NODATA, Grid, ORDER, SCALAR_NODATA, missing, profile};
 
 #[derive(Debug)]
 pub struct D8Result {
@@ -43,7 +43,9 @@ pub fn d8_flow(
         })
         .collect();
     let row_factors = |row| &factors[if factors.len() == 1 { 0 } else { row }];
+    let steep = profile::span("d8.steep");
     let mut direction = vec![DIRECTION_NODATA; grid.cells];
+    profile::buffer("d8.direction", direction.len());
     direction
         .par_chunks_mut(grid.width)
         .enumerate()
@@ -71,6 +73,8 @@ pub fn d8_flow(
             }
         });
 
+    drop(steep);
+    let crossing = profile::span("d8.crossing_and_flat_scan");
     let mut flats = Vec::new();
     // TauDEM tests crossing against directions it has already assigned.
     // The unrestricted winner only needs reevaluation when it crosses.
@@ -87,9 +91,14 @@ pub fn d8_flow(
         }
     }
 
+    profile::count("d8.flat_cells", flats.len() as u64);
+    profile::buffer("d8.flat_list", flats.capacity() * 4);
+    drop(crossing);
     // TauDEM writes sd8 before routing across artificial flat elevations.
     let slope = with_slope.then(|| {
+        let _span = profile::span("d8.slope");
         let mut slope = vec![SCALAR_NODATA; grid.cells];
+        profile::buffer("d8.slope", slope.len() * 4);
         slope
             .par_chunks_mut(grid.width)
             .enumerate()
@@ -108,6 +117,7 @@ pub fn d8_flow(
     });
 
     if !flats.is_empty() {
+        let _span = profile::span("d8.flats");
         resolve_flats(grid, elevations, &mut direction, flats, &row_factors);
     }
     D8Result { direction, slope }
@@ -156,9 +166,16 @@ fn resolve_flats<'a>(
     let mut artificial = Vec::new();
     let mut fall = vec![0u32; grid.cells];
     let mut rise = vec![0u32; grid.cells];
+    profile::buffer("d8.flats.fall", fall.len() * 4);
+    profile::buffer("d8.flats.rise", rise.len() * 4);
     let mut frontier = VecDeque::new();
+    let mut peak_frontier = 0usize;
+    let mut pass = 0;
 
     loop {
+        pass += 1;
+        profile::count("d8.flats.passes", 1);
+        let fall_span = profile::span(format!("d8.flats.pass{pass}.fall"));
         let elevations = if artificial.is_empty() {
             elevations
         } else {
@@ -195,6 +212,7 @@ fn resolve_flats<'a>(
             }
         }
         let mut last_fall = 0;
+        peak_frontier = peak_frontier.max(frontier.len());
         while let Some(i) = frontier.pop_front() {
             let i = i as usize;
             last_fall = fall[i];
@@ -211,6 +229,9 @@ fn resolve_flats<'a>(
             }
         }
 
+        peak_frontier = peak_frontier.max(frontier.capacity());
+        drop(fall_span);
+        let rise_span = profile::span(format!("d8.flats.pass{pass}.rise"));
         // incrise: BFS from higher terrain across the entire unresolved set.
         // The original scan increments each marked cell on every remaining
         // pass, including the final pass with no newly marked cells.
@@ -234,6 +255,9 @@ fn resolve_flats<'a>(
             }
         }
 
+        peak_frontier = peak_frontier.max(frontier.capacity());
+        drop(rise_span);
+        let set_span = profile::span(format!("d8.flats.pass{pass}.directions"));
         for &i in &flats {
             let i = i as usize;
             if fall[i] == 0 {
@@ -270,10 +294,28 @@ fn resolve_flats<'a>(
 
         let previous = flats.len();
         flats.retain(|&i| dirs[i as usize] == 0);
+        drop(set_span);
+        profile::count(
+            match pass {
+                1 => "d8.flats.pass1.cells",
+                2 => "d8.flats.pass2.cells",
+                3 => "d8.flats.pass3.cells",
+                _ => "d8.flats.later_pass.cells",
+            },
+            previous as u64,
+        );
+        profile::count("d8.flats.max_fall", u64::from(last_fall));
+        profile::count("d8.flats.max_rise", u64::from(last_rise));
         if flats.is_empty() || flats.len() == previous {
+            profile::count("d8.flats.unresolved_cells", flats.len() as u64);
+            profile::buffer("d8.flats.frontier_peak", peak_frontier * 4);
             break;
         }
+        let _artificial_span = profile::span(format!("d8.flats.pass{pass}.artificial"));
         // TauDEM only replaces the input surface for subsequent flat passes.
+        if artificial.is_empty() {
+            profile::buffer("d8.flats.artificial", grid.cells * 4);
+        }
         artificial.resize(grid.cells, 0.0);
         for (i, z) in artificial.iter_mut().enumerate() {
             *z = surface(i) as f32;

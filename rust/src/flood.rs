@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{FEL_NODATA, Grid, missing};
+use crate::{FEL_NODATA, Grid, missing, profile};
 
 /// Fills depressions in place to their lowest spill elevation. Raster edges,
 /// cells adjacent to nodata, and cells with mask value 1 are fixed outlets.
@@ -17,7 +17,9 @@ pub fn pit_remove(
     assert_eq!(elevations.len(), grid.cells);
     assert!(mask.is_none_or(|mask| mask.len() == grid.cells));
     let step = if four_way { 2 } else { 1 };
+    let seeding = profile::span("pitremove.seed");
     let mut visited = vec![0u64; grid.cells.div_ceil(64)];
+    profile::buffer("pitremove.visited", visited.len() * 8);
     let mut heap = FloodQueue::new();
     let mut pit = VecDeque::new();
 
@@ -60,6 +62,14 @@ pub fn pit_remove(
         }
     }
 
+    profile::count("pitremove.seeds", heap.len() as u64);
+    drop(seeding);
+    let flooding = profile::span("pitremove.flood");
+    let mut pit_cells = 0u64;
+    let mut heap_cells = 0u64;
+    let mut peak_heap = 0usize;
+    let mut peak_pit = 0usize;
+    let mut iterations = 0u32;
     while let Some(cell) = pit.pop_front().or_else(|| heap.pop()) {
         let i = cell as usize;
         let height = elevations[i];
@@ -68,12 +78,24 @@ pub fn pit_remove(
                 if elevations[j] <= height {
                     elevations[j] = height;
                     pit.push_back(j as u32);
+                    pit_cells += 1;
                 } else {
                     heap.push(priority(elevations[j], j));
+                    heap_cells += 1;
                 }
             }
         });
+        iterations = iterations.wrapping_add(1);
+        if iterations & 0xffff == 0 {
+            peak_heap = peak_heap.max(heap.len());
+            peak_pit = peak_pit.max(pit.len());
+        }
     }
+    profile::count("pitremove.raised_or_level_cells", pit_cells);
+    profile::count("pitremove.heap_cells", heap_cells);
+    profile::buffer("pitremove.heap_sampled_peak", peak_heap * 8);
+    profile::buffer("pitremove.fifo_sampled_peak", peak_pit * 4);
+    drop(flooding);
 }
 
 #[inline]
@@ -115,6 +137,10 @@ impl FloodQueue {
             used: 0,
             last: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.iter().map(Vec::len).sum()
     }
 
     #[inline]

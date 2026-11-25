@@ -12,6 +12,13 @@ taudem-rs pipeline -z dem.tif [-fel fel.tif] [-p p.tif] [-sd8 sd8.tif] [-ad8 ad8
                    [-4] [-depmask mask.tif] [-nc]
 ```
 
+Every subcommand also accepts `--profile-json PATH`. The JSON file has the
+read, compute and write totals, nested phase spans (seconds, heap in use at
+entry and exit, heap high-water mark inside the span and per cell), counters
+such as flat-cell and pass counts, the sizes of the main working buffers, and
+the heap and process (peak working set or VmHWM) high-water marks. The heap
+figures come from a counting global allocator in the binary.
+
 The pipeline passes arrays between stages and writes only the requested
 products. With no output paths it still computes contributing area and prints
 timings. Use `-4` or `-4way` for cardinal-only PitRemove connectivity. A depression mask

@@ -10,7 +10,11 @@ use std::{
 };
 
 use io::{Product, Raster, Result, write};
+use taudem_rs::profile::{self, CountingAlloc};
 use taudem_rs::{FEL_NODATA, SCALAR_NODATA, area_d8, d8_flow, pit_remove};
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
 
 const HELP: &str = "\
 taudem-rs pitremove  -z DEM -fel FILLED [-4] [-depmask MASK]
@@ -18,9 +22,11 @@ taudem-rs d8flowdir  -fel FILLED -p DIRECTIONS -sd8 SLOPE
 taudem-rs aread8     -p DIRECTIONS -ad8 AREA [-nc]
 taudem-rs pipeline   -z DEM [-fel FILLED] [-p DIRECTIONS] [-sd8 SLOPE] [-ad8 AREA]
                          [-4] [-depmask MASK] [-nc]
+Every subcommand also accepts --profile-json PATH.
 
 All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
 without output paths. -nc disables downstream edge-contamination checks.
+--profile-json writes phase timings, counters and memory use as JSON.
 Set RAYON_NUM_THREADS to control the number of worker threads.";
 
 fn main() -> ExitCode {
@@ -60,10 +66,11 @@ fn run(args: Vec<String>) -> Result<()> {
         _ => return Err(format!("unknown subcommand {command}\n{HELP}").into()),
     };
     let mut options = HashMap::new();
+    let argv = args.clone();
     let mut args = args[1..].iter();
     while let Some(flag) = args.next().map(String::as_str) {
         let flag = if flag == "-4way" { "-4" } else { flag };
-        if !required.contains(&flag) && !optional.contains(&flag) {
+        if !required.contains(&flag) && !optional.contains(&flag) && flag != "--profile-json" {
             return Err(if matches!(flag, "-o" | "-wg" | "-sfdr") {
                 format!("{flag} is not supported in stage one")
             } else {
@@ -88,11 +95,14 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
 
+    profile::start();
     let total = Instant::now();
     let mut timings = Timings::default();
+    let cells;
     let check_contamination = !options.contains_key("-nc");
     let output = |timing: &mut Timings, raster: &Raster, flag: &str, product: Product<'_>| {
         if let Some(path) = options.get(flag) {
+            let _span = profile::span(format!("write.{}", &flag[1..]));
             let start = Instant::now();
             write(path, &raster.header, product)
                 .map_err(|error| format!("writing {path}: {error}"))?;
@@ -102,11 +112,16 @@ fn run(args: Vec<String>) -> Result<()> {
     };
 
     if command == "aread8" {
+        let reading = profile::span("read");
         let mut raster = Raster::open(options["-p"])?;
+        cells = raster.grid.cells();
         let direction = raster.directions()?;
+        drop(reading);
         timings.read = total.elapsed();
         let start = Instant::now();
+        let span = profile::span("aread8");
         let area = area_d8(raster.grid, &direction, check_contamination);
+        drop(span);
         timings.stage("AreaD8", start);
         output(
             &mut timings,
@@ -116,7 +131,9 @@ fn run(args: Vec<String>) -> Result<()> {
         )?;
     } else {
         let fill = command != "d8flowdir";
+        let reading = profile::span("read");
         let mut raster = Raster::open(options[if fill { "-z" } else { "-fel" }])?;
+        cells = raster.grid.cells();
         let nodata = raster.nodata();
         let mut elevations = raster.elevations()?;
         let mask = if let Some(path) = options.get("-depmask") {
@@ -131,9 +148,11 @@ fn run(args: Vec<String>) -> Result<()> {
         } else {
             raster.spacing()?
         };
+        drop(reading);
         timings.read = total.elapsed();
         if fill {
             let start = Instant::now();
+            let span = profile::span("pitremove");
             pit_remove(
                 raster.grid,
                 &mut elevations,
@@ -142,6 +161,7 @@ fn run(args: Vec<String>) -> Result<()> {
                 mask.as_deref(),
             );
             drop(mask);
+            drop(span);
             timings.stage("PitRemove", start);
             output(
                 &mut timings,
@@ -152,6 +172,7 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         if command != "pitremove" {
             let start = Instant::now();
+            let span = profile::span("d8flowdir");
             let flow = d8_flow(
                 raster.grid,
                 &elevations,
@@ -160,6 +181,7 @@ fn run(args: Vec<String>) -> Result<()> {
                 options.contains_key("-sd8"),
             );
             drop(elevations);
+            drop(span);
             timings.stage("D8FlowDir", start);
             output(
                 &mut timings,
@@ -177,7 +199,9 @@ fn run(args: Vec<String>) -> Result<()> {
             }
             if command == "pipeline" {
                 let start = Instant::now();
+                let span = profile::span("aread8");
                 let area = area_d8(raster.grid, &flow.direction, check_contamination);
+                drop(span);
                 timings.stage("AreaD8", start);
                 output(
                     &mut timings,
@@ -197,6 +221,33 @@ fn run(args: Vec<String>) -> Result<()> {
         timings.write.as_secs_f64(),
         total.elapsed().as_secs_f64()
     );
+    if let Some(path) = options.get("--profile-json") {
+        let json = profile::report().to_json(
+            &[
+                ("tool", profile::quote("taudem-rs")),
+                ("version", profile::quote(env!("CARGO_PKG_VERSION"))),
+                ("command", profile::quote(command)),
+                (
+                    "argv",
+                    format!(
+                        "[{}]",
+                        argv.iter()
+                            .map(|a| profile::quote(a))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ),
+                ("threads", rayon::current_num_threads().to_string()),
+                ("cells", cells.to_string()),
+                ("read_s", format!("{:.6}", timings.read.as_secs_f64())),
+                ("compute_s", format!("{:.6}", timings.compute.as_secs_f64())),
+                ("write_s", format!("{:.6}", timings.write.as_secs_f64())),
+                ("total_s", format!("{:.6}", total.elapsed().as_secs_f64())),
+            ],
+            cells,
+        );
+        std::fs::write(path, json).map_err(|error| format!("writing {path}: {error}"))?;
+    }
     Ok(())
 }
 

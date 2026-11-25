@@ -4,6 +4,7 @@
 mod area;
 mod d8;
 mod flood;
+pub mod profile;
 
 pub use area::area_d8;
 pub use d8::{D8Result, d8_flow};
@@ -29,6 +30,18 @@ pub struct Grid {
 }
 
 impl Grid {
+    pub fn width(self) -> usize {
+        self.width
+    }
+
+    pub fn height(self) -> usize {
+        self.height
+    }
+
+    pub fn cells(self) -> usize {
+        self.cells
+    }
+
     pub fn new(width: usize, height: usize) -> Option<Self> {
         let cells = width.checked_mul(height)?;
         if cells == 0 || cells > u32::MAX as usize || cells > isize::MAX as usize {
