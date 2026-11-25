@@ -3,6 +3,7 @@
 mod d8flowdir_tiled;
 mod io;
 mod tiled_aread8;
+mod tiled_pipeline;
 
 use std::{
     collections::HashMap,
@@ -17,6 +18,7 @@ use taudem_rs::pitremove_tiled::PitRemovePlan;
 use taudem_rs::profile::{self, CountingAlloc};
 use taudem_rs::tiling::{ExecutionMode, ExecutionOptions, TileSpec, auto_tile_size};
 use taudem_rs::{FEL_NODATA, SCALAR_NODATA, Surface, area_d8, d8_steep, pit_remove};
+use terrio::open_raster_lazy;
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -30,12 +32,13 @@ taudem-rs pipeline   -z DEM [-fel FILLED] [-p DIRECTIONS] [-sd8 SLOPE] [-ad8 ARE
 Every subcommand also accepts --profile-json PATH, --mode auto|in-memory|tiled,
 --max-memory BYTES (such as 4G), --tile-size CELLS and --scratch-dir DIR.
 
-All inputs and outputs are GeoTIFFs. Pipeline computes area in memory even
-without output paths. -nc disables downstream edge-contamination checks.
+All inputs and outputs are GeoTIFFs. Pipeline computes area even without
+output paths. -nc disables downstream edge-contamination checks.
 --profile-json writes phase timings, counters and memory use as JSON.
---mode tiled selects out-of-core execution within --max-memory
-(pitremove, d8flowdir and aread8 so far); auto runs them tiled when their
-in-memory estimate exceeds the budget, and in memory otherwise.
+--mode tiled runs out of core within --max-memory; auto (the default) runs
+tiled when the in-memory estimate exceeds the budget or the raster exceeds
+the in-memory cell limit, and in memory otherwise. The tiled pipeline is
+fused: the DEM is read once and every stage shares one tile cache.
 --max-memory defaults to the smaller of 65% of usable and 75% of available
 memory. Tiled outputs match the in-memory ones bit for bit; --exact-area
 (tiled aread8 only) instead sums exact integer counts, which differ from
@@ -120,13 +123,7 @@ fn run(args: Vec<String>) -> Result<()> {
     }
     let execution = ExecutionOptions::from_flags(|flag| options.get(flag).copied())?;
     let exact_area = options.contains_key("--exact-area");
-    let tiled =
-        command == "aread8" && tiled_aread8::use_tiled(options["-p"], &execution, exact_area)?;
-    if execution.mode == ExecutionMode::Tiled
-        && !matches!(command, "pitremove" | "d8flowdir" | "aread8")
-    {
-        return Err(format!("--mode tiled is not yet implemented for {command}").into());
-    }
+    let tiled = wants_tiled(command, &options, &execution)?;
 
     profile::start();
     let total = Instant::now();
@@ -144,19 +141,20 @@ fn run(args: Vec<String>) -> Result<()> {
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 
-    let tiled_input = if command == "d8flowdir" && execution.mode != ExecutionMode::InMemory {
+    if tiled && command == "pipeline" {
+        let run = tiled_pipeline::run(&options, &execution, check_contamination)?;
+        cells = run.cells;
+        timings.read = run.open + run.read;
+        timings.write = run.write;
+        timings.add("Pipeline", run.compute);
+    } else if tiled && command == "d8flowdir" {
         let raster = Raster::open(options["-fel"])?;
-        d8flowdir_tiled::wanted(&execution, &raster).then_some(raster)
-    } else {
-        None
-    };
-    if let Some(raster) = tiled_input {
         let run = d8flowdir_tiled::run(raster, options["-p"], options["-sd8"], &execution)?;
         cells = run.cells as u64;
         timings.read = run.read;
         timings.write = run.write;
         timings.add("D8FlowDir", run.compute);
-    } else if tiled {
+    } else if tiled && command == "aread8" {
         let mut area = AreaOptions::new(check_contamination);
         if exact_area {
             area = area.with_arithmetic(Arithmetic::Exact);
@@ -167,6 +165,14 @@ fn run(args: Vec<String>) -> Result<()> {
         timings.add("AreaD8", outcome.compute);
         timings.write = outcome.write;
         report_tiled(&outcome, &execution);
+    } else if tiled {
+        let reading = profile::span("read");
+        let mut raster = Raster::open(options["-z"])?;
+        let (width, height) = raster.dimensions();
+        cells = width as u64 * height as u64;
+        drop(reading);
+        timings.read = total.elapsed();
+        tiled_pitremove(&mut raster, &options, execution, &mut timings)?;
     } else if command == "aread8" {
         let reading = profile::span("read");
         let mut raster = Raster::open(options["-p"])?;
@@ -192,21 +198,7 @@ fn run(args: Vec<String>) -> Result<()> {
         let mut raster = Raster::open(options[if fill { "-z" } else { "-fel" }])?;
         let (width, height) = raster.dimensions();
         cells = width as u64 * height as u64;
-        let has_mask = options.contains_key("-depmask");
-        let estimate = cells.saturating_mul(if has_mask { 9 } else { 8 });
-        let tiled = command == "pitremove"
-            && match execution.mode {
-                ExecutionMode::Tiled => true,
-                ExecutionMode::Auto => {
-                    estimate > execution.memory_budget() || raster.grid().is_err()
-                }
-                ExecutionMode::InMemory => false,
-            };
-        if tiled {
-            drop(reading);
-            timings.read = total.elapsed();
-            tiled_pitremove(&mut raster, &options, execution, &mut timings)?;
-        } else {
+        {
             let grid = raster.grid()?;
             let nodata = raster.nodata();
             let mut elevations = raster.elevations()?;
@@ -329,6 +321,62 @@ fn run(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// The process baseline of an in-memory run (image, thread stacks, decoder
+/// tables), below the per-cell estimate.
+const IN_MEMORY_BASELINE: u64 = 48 << 20;
+
+/// Peak working set per cell of each in-memory command above
+/// [`IN_MEMORY_BASELINE`], rounded up from `--profile-json` runs at 8
+/// threads: pitremove 5.8-6.5 (Muncie, Spring Creek, the RAS 7.0 mosaic,
+/// ELC), d8flowdir 8.6-9.7, aread8 6.5-7.1, pipeline 8.6-9.7 (ELC 9.1).
+/// A depression mask adds a byte per cell while PitRemove runs.
+fn in_memory_bytes(command: &str, cells: u64, has_mask: bool) -> u64 {
+    let per_cell = match command {
+        "pitremove" => 6.5 + if has_mask { 1.0 } else { 0.0 },
+        "aread8" => 7.5,
+        _ => 10.0,
+    };
+    IN_MEMORY_BASELINE + (cells as f64 * per_cell) as u64
+}
+
+/// Whether `command` runs tiled: `--mode tiled`; `--mode auto` when the
+/// in-memory estimate exceeds the budget, the raster exceeds the in-memory
+/// 32-bit cell index, or `--exact-area` asks for tiled arithmetic.
+fn wants_tiled(
+    command: &str,
+    options: &HashMap<&str, &str>,
+    execution: &ExecutionOptions,
+) -> Result<bool> {
+    let exact = options.contains_key("--exact-area");
+    match execution.mode {
+        ExecutionMode::Tiled => Ok(true),
+        ExecutionMode::InMemory if exact => {
+            Err("--exact-area requires tiled execution (--mode tiled or auto)".into())
+        }
+        ExecutionMode::InMemory => Ok(false),
+        ExecutionMode::Auto if exact => Ok(true),
+        ExecutionMode::Auto => {
+            let input = options[match command {
+                "d8flowdir" => "-fel",
+                "aread8" => "-p",
+                _ => "-z",
+            }];
+            let raster =
+                open_raster_lazy(input).map_err(|error| format!("opening {input}: {error}"))?;
+            let cells = raster.width() as u64 * raster.height() as u64;
+            let estimate = in_memory_bytes(command, cells, options.contains_key("-depmask"));
+            let tiled = cells > u64::from(u32::MAX) || estimate > execution.memory_budget();
+            println!(
+                "Mode: {} (in-memory estimate {:.0} MiB, budget {:.0} MiB)",
+                if tiled { "tiled" } else { "in-memory" },
+                estimate as f64 / (1u64 << 20) as f64,
+                execution.memory_budget() as f64 / (1u64 << 20) as f64
+            );
+            Ok(tiled)
+        }
+    }
+}
+
 fn tiled_pitremove(
     raster: &mut Raster,
     flags: &HashMap<&str, &str>,
@@ -374,7 +422,9 @@ fn tiled_pitremove(
         } else {
             0
         };
-        execution.max_memory = Some(budget.saturating_sub(writer_reserve));
+        // A striped DEM's halos come from full-width bands the reader keeps.
+        let bands = io::band_bytes(raster, w, h);
+        execution.max_memory = Some(budget.saturating_sub(writer_reserve + bands));
         match PitRemovePlan::new(spec, &execution, nodata, four_way, mask.is_some()) {
             Ok(plan) => {
                 if execution.tile_size.is_some()
@@ -435,6 +485,7 @@ fn tiled_pitremove(
         stats.cache.spill_writes,
         stats.cache.spill_write_bytes
     );
+    stats.cache.record_profile();
     Ok(())
 }
 

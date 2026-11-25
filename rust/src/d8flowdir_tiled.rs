@@ -11,31 +11,11 @@ use taudem_rs::d8_tiled::{
     D8Outcome, D8TileStats, SteepSchedule, WORK_BYTES_PER_CELL, d8_flow_tiled, tile_size_for_budget,
 };
 use taudem_rs::tiling::{
-    ExecutionMode, ExecutionOptions, HaloWindow, TileCache, TileId, TileSpec, auto_tile_size,
+    ExecutionOptions, HaloWindow, TileCache, TileId, TileSpec, auto_tile_size, workers,
 };
 use taudem_rs::{DIRECTION_NODATA, SCALAR_NODATA, profile};
 
-use crate::io::{P_NODATA, Raster, Result, tile_writer};
-
-/// Approximate peak bytes per cell of the in-memory d8flowdir: elevations,
-/// directions, packed increment levels and the search frontier.
-const IN_MEMORY_BYTES_PER_CELL: u64 = 10;
-
-/// Whether d8flowdir runs tiled: `--mode tiled`, or `--mode auto` when the
-/// in-memory estimate exceeds the budget or the raster exceeds the
-/// in-memory 32-bit index.
-pub fn wanted(execution: &ExecutionOptions, raster: &Raster) -> bool {
-    match execution.mode {
-        ExecutionMode::Tiled => true,
-        ExecutionMode::InMemory => false,
-        ExecutionMode::Auto => {
-            let (w, h) = raster.dimensions();
-            let cells = w as u64 * h as u64;
-            raster.grid().is_err()
-                || cells.saturating_mul(IN_MEMORY_BYTES_PER_CELL) > execution.memory_budget()
-        }
-    }
-}
+use crate::io::{P_NODATA, Raster, Result, band_bytes, tile_writer};
 
 pub struct TiledRun {
     pub cells: usize,
@@ -57,7 +37,7 @@ pub fn run(
     let nodata = raster.nodata();
     let spacing = raster.spacing()?;
     let header = raster.header.clone();
-    let threads = rayon::current_num_threads();
+    let threads = workers::threads();
     let budget = execution.memory_budget();
     let cells = width as u64 * height as u64;
     let spec = match execution.tile_size {
@@ -78,7 +58,8 @@ pub fn run(
     let queues = 2 * 4 * threads as u64 * 256 * 256 * 4;
     // The process itself (code, thread stacks, the reader's decode buffers,
     // allocator slack) takes the rest.
-    let reserve = (64 << 20) + budget / 10;
+    // A striped input's halos come from full-width bands the reader keeps.
+    let reserve = (64 << 20) + budget / 10 + band_bytes(&raster, tw, th);
     let cache_budget = budget
         .saturating_sub(workers + borders + queues + reserve)
         .max(budget / 8);

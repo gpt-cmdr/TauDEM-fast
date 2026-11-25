@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{error::Error, path::Path, sync::RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::{error::Error, path::Path};
 
 use taudem_rs::pitremove_tiled::SolvedPitRemove;
 use taudem_rs::tiling::{self, AsyncTileWriter, HaloWindow, Rect, TileSpec};
@@ -168,16 +169,7 @@ impl Raster {
 
     pub fn directions(&mut self) -> Result<Vec<u8>> {
         let nodata = self.input.band_nodata(1).unwrap_or(-9999.0);
-        let convert = |z: f64| {
-            if !z.is_finite() || z == nodata {
-                DIRECTION_NODATA
-            } else {
-                match z.round() as i16 {
-                    k @ 0..=8 => k as u8,
-                    _ => INVALID_DIRECTION,
-                }
-            }
-        };
+        let convert = |z: f64| direction_code(z, nodata);
         let mut directions = Vec::with_capacity(self.input.width() * self.input.height());
         self.read_stripes(|stripe| match stripe {
             RasterData::I16(data) => {
@@ -194,6 +186,19 @@ impl Raster {
             mask.extend((0..stripe.len()).map(|i| u8::from(stripe.get_f64(i).round() == 1.0)));
         })?;
         Ok(mask)
+    }
+}
+
+/// A D8 code read from a direction raster: `0..=8`, [`DIRECTION_NODATA`] for
+/// nodata or non-finite values, [`INVALID_DIRECTION`] for anything else.
+pub fn direction_code(z: f64, nodata: f64) -> u8 {
+    if !z.is_finite() || z == nodata {
+        DIRECTION_NODATA
+    } else {
+        match z.round() as i16 {
+            k @ 0..=8 => k as u8,
+            _ => INVALID_DIRECTION,
+        }
     }
 }
 
@@ -269,7 +274,7 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
     Ok(())
 }
 
-fn is_tiff(path: &str) -> bool {
+pub fn is_tiff(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -342,13 +347,41 @@ pub fn write_fel_tiles(
     Ok(stats)
 }
 
+/// Full-width bands of a striped raster kept for elevation halos.
+const BANDS: usize = 3;
+
+/// The bytes a [`TileReader`] may hold in elevation bands for halos of tiles
+/// `tile_height` rows high: [`BANDS`] full-width bands for a striped raster
+/// whose tiles are narrower than it, nothing otherwise.
+pub fn band_bytes(raster: &Raster, tile_width: usize, tile_height: usize) -> u64 {
+    let (width, _) = raster.dimensions();
+    match raster.block_size() {
+        Some((block, _)) if block == width && tile_width < width => {
+            (BANDS * width * (tile_height + 2) * 4) as u64
+        }
+        _ => 0,
+    }
+}
+
+/// One full-width band of elevations: halo rows `y..y + rows`.
+type Band = Arc<OnceLock<std::result::Result<Vec<f32>, String>>>;
+
 /// Concurrent caller-buffer reads of tile windows for ordinary TIFF layouts.
 /// Only layouts that require Terrio's owned-window path take the exclusive
 /// decoder lock.
+///
+/// Striped rasters store whole rows, so a tile's window decodes every strip
+/// it crosses in full. Their elevation halos are cut from full-width bands
+/// instead, each read once for a row of tiles ([`band_bytes`]).
 pub struct TileReader<'a> {
     input: RwLock<&'a mut LazyRaster>,
     dtype: DataType,
     strip_rows: Option<(usize, usize)>,
+    nodata: f64,
+    width: usize,
+    striped: bool,
+    /// Recent bands by `(y, rows)`, oldest first.
+    bands: Mutex<Vec<((usize, usize), Band)>>,
 }
 
 impl<'a> TileReader<'a> {
@@ -359,11 +392,48 @@ impl<'a> TileReader<'a> {
         let max_rows = TiffReadLimits::from_config()?.chunk_bytes / row_bytes.max(1);
         let strip_rows = (block == input.width() && max_rows < strip_height.min(input.height()))
             .then_some((max_rows.max(1), strip_height));
+        let nodata = input.band_nodata(1).unwrap_or(-9999.0);
+        let width = input.width();
         Ok(Self {
             input: RwLock::new(input),
             dtype,
             strip_rows,
+            nodata,
+            width,
+            striped: block == width,
+            bands: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The band of halo rows `y..y + rows`, read once by its first user.
+    fn band(&self, y: usize, rows: usize) -> tiling::Result<Band> {
+        let band = {
+            let mut bands = self.bands.lock().map_err(|_| lock_error())?;
+            match bands.iter().find(|(key, _)| *key == (y, rows)) {
+                Some((_, band)) => band.clone(),
+                None => {
+                    let band = Band::default();
+                    if bands.len() == BANDS {
+                        bands.remove(0);
+                    }
+                    bands.push(((y, rows), band.clone()));
+                    band
+                }
+            }
+        };
+        band.get_or_init(|| {
+            let rect = Rect {
+                x: 0,
+                y,
+                width: self.width,
+                height: rows,
+            };
+            let mut data = vec![0.0f32; rect.cells()];
+            self.samples(rect, &mut data, |z| z as f32)
+                .map(|()| data)
+                .map_err(|error| error.to_string())
+        });
+        Ok(band)
     }
 
     /// Fills a halo buffer with the window's elevations as `f32`, each at
@@ -371,6 +441,19 @@ impl<'a> TileReader<'a> {
     pub fn halo(&self, halo: &HaloWindow, buffer: &mut [f32]) -> tiling::Result<()> {
         let window = halo.window;
         let width = halo.buffer_width();
+        if self.striped && window.width < self.width {
+            let band = self.band(window.y, window.height)?;
+            let rows = match band.get().expect("initialized") {
+                Ok(rows) => rows,
+                Err(error) => return Err(tiling::Error::Invalid(error.clone())),
+            };
+            for row in 0..window.height {
+                let src = row * self.width + window.x;
+                let dst = (row + halo.pad_top) * width + halo.pad_left;
+                buffer[dst..dst + window.width].copy_from_slice(&rows[src..src + window.width]);
+            }
+            return Ok(());
+        }
         // Read the window to the front, then move rows back to their place
         // without allocating a second window.
         self.samples(window, &mut buffer[..window.cells()], |z| z as f32)?;
@@ -378,6 +461,35 @@ impl<'a> TileReader<'a> {
             let src = row * window.width;
             let dst = (row + halo.pad_top) * width + halo.pad_left;
             buffer.copy_within(src..src + window.width, dst);
+        }
+        Ok(())
+    }
+
+    /// Fills `buffer` with a halo buffer of D8 codes, converted as
+    /// [`Raster::directions`] converts them; [`DIRECTION_NODATA`] outside the
+    /// raster.
+    pub fn codes_halo(&self, halo: &HaloWindow, buffer: &mut Vec<u8>) -> tiling::Result<()> {
+        let window = halo.window;
+        let width = halo.buffer_width();
+        buffer.clear();
+        buffer.resize(halo.buffer_cells(), DIRECTION_NODATA);
+        let nodata = self.nodata;
+        self.samples(window, &mut buffer[..window.cells()], |z| {
+            direction_code(z, nodata)
+        })?;
+        for row in (0..window.height).rev() {
+            let src = row * window.width;
+            let dst = (row + halo.pad_top) * width + halo.pad_left;
+            buffer.copy_within(src..src + window.width, dst);
+        }
+        // The moves leave read values in the padding: reset it.
+        for (y, row) in buffer.chunks_exact_mut(width).enumerate() {
+            if y < halo.pad_top || y >= halo.buffer_height() - halo.pad_bottom {
+                row.fill(DIRECTION_NODATA);
+            } else {
+                row[..halo.pad_left].fill(DIRECTION_NODATA);
+                row[width - halo.pad_right..].fill(DIRECTION_NODATA);
+            }
         }
         Ok(())
     }
