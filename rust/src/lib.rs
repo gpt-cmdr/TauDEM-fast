@@ -3,6 +3,7 @@
 
 mod area;
 mod d8;
+pub mod d8_tiled;
 mod flood;
 pub mod profile;
 pub mod tiling;
