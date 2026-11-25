@@ -691,7 +691,7 @@ impl SpillTable {
 /// outlet: the minimum over paths of the highest edge on the path. Edges are
 /// joined in rising order (Kruskal); a component's level is the weight of the
 /// edge that first joins it to the outlet's component.
-fn minimax(nodes: usize, mut edges: Vec<(u32, u32, f32)>) -> Vec<f32> {
+pub(crate) fn minimax(nodes: usize, mut edges: Vec<(u32, u32, f32)>) -> Vec<f32> {
     edges.par_sort_unstable_by_key(|&(_, _, w)| sort_key(w));
     let mut parent: Vec<u32> = (0..nodes as u32).collect();
     // Members of each component as a linked list from its root.
@@ -825,14 +825,15 @@ fn sort_key(height: f32) -> u32 {
 }
 
 #[inline]
-fn priority(height: f32, i: usize) -> u64 {
+pub(crate) fn priority(height: f32, i: usize) -> u64 {
     (u64::from(sort_key(height)) << 32) | i as u64
 }
 
 /// Monotone radix heap. New priority elevations cannot be lower than the
 /// last one removed, so only the populated bucket nearest that key needs
 /// redistribution. Each entry packs a float sort key and a cell index.
-struct FloodQueue {
+pub(crate) struct FloodQueue {
+    bounded: bool,
     buckets: [Vec<u64>; 33],
     used: u64,
     last: u32,
@@ -841,6 +842,7 @@ struct FloodQueue {
 impl Default for FloodQueue {
     fn default() -> Self {
         Self {
+            bounded: false,
             buckets: std::array::from_fn(|_| Vec::new()),
             used: 0,
             last: 0,
@@ -849,7 +851,16 @@ impl Default for FloodQueue {
 }
 
 impl FloodQueue {
-    fn reset(&mut self) {
+    /// The streaming worker can drop drained allocations to keep the total
+    /// capacity proportional to the active frontier.
+    pub(crate) fn bounded() -> Self {
+        Self {
+            bounded: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
         for bucket in &mut self.buckets {
             bucket.clear();
         }
@@ -858,7 +869,7 @@ impl FloodQueue {
     }
 
     #[inline]
-    fn push(&mut self, entry: u64) {
+    pub(crate) fn push(&mut self, entry: u64) {
         let key = (entry >> 32) as u32;
         debug_assert!(key >= self.last);
         let bucket = 32 - (key ^ self.last).leading_zeros();
@@ -867,7 +878,7 @@ impl FloodQueue {
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<u32> {
+    pub(crate) fn pop(&mut self) -> Option<u32> {
         if self.used & 1 == 0 {
             if self.used == 0 {
                 return None;
@@ -877,6 +888,9 @@ impl FloodQueue {
         let entry = self.buckets[0].pop()?;
         if self.buckets[0].is_empty() {
             self.used &= !1;
+            if self.bounded && self.buckets[0].capacity() > 1024 {
+                self.buckets[0] = Vec::new();
+            }
         }
         Some(entry as u32)
     }
@@ -890,6 +904,8 @@ impl FloodQueue {
         for entry in entries.drain(..) {
             self.push(entry);
         }
-        self.buckets[bucket] = entries;
+        if !self.bounded || entries.capacity() <= 1024 {
+            self.buckets[bucket] = entries;
+        }
     }
 }

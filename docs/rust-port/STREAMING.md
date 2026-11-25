@@ -81,6 +81,17 @@ Purely in-memory changes (the domain of the concurrent optimization agent) can c
   4. **Pass 2**: Re-read raw `z` (and optional `depmask`) for tile $T$, overwrite every non-outlet perimeter cell `p` with `Z_global[p]`, seed `OUTSIDE` at `Z` and perimeter cells at `Z_global[p]`, and run local Priority-Flood. Since `Z_global[p]` already incorporates all paths inside and outside $T$, Pass 2 produces exact global `fel` for every interior cell.
 - **Evict vs Retain**: Evicting `z` and `fel_local` after Pass 1 costs **0 intermediate storage** because local DEFLATE GeoTIFFs sit in OS page cache (1.3 s to re-read ELC). Only retain if input is remote or slow uncompressed/striped.
 
+**WP-S1 implementation**: Pass 1 runs a radix-queue Priority-Flood and
+builds each tile's spill forest online with Kruskal as adjacent labels are
+settled. The global solve reuses the in-memory Kruskal minimax solver.
+Pass 2 raises the cached local fill by its watershed's solved level. The
+two intermediate layers share a budgeted `TileStore`, so this path needs
+one DEM read. Where the input contains valid negative zero, a separate
+perimeter connectivity solve preserves signed-zero bits, including in the
+final halos delivered by `SolvedPitRemove::emit`. All-nodata tiles bypass
+the flood and intermediate storage. Positioned TIFF reads handle physically
+sparse input blocks, and the output writer omits all-nodata blocks.
+
 ### 2.2 Stage 2a: D8 Steep Pass & Slope (`sd8`)
 
 - **Core 3×3 stencil** (`d8.rs:47-72`, `d8.cpp:359-409`): Any nodata or global-border 8-neighbor yields `DIRECTION_NODATA`; else `steepest` evaluates `ORDER = [1,3,5,7,2,4,6,8]` with per-row WGS84 `row_factors` (`io.rs:54-84`).
@@ -88,6 +99,7 @@ Purely in-memory changes (the domain of the concurrent optimization agent) can c
   - `crosses(grid, &direction, i, k, i)` depends **only** on already-finalized directions north (`i - W`: `k=2` checks `dirs[N]==8`, `k=4` checks `dirs[N]==6`) and west (`i - 1`: `k=4` checks `dirs[W]==2`, `k=6` checks `dirs[W]==8`). `k=8` never crosses in row-major order.
   - Because `calcSlope` (`d8.cpp:281-282`, `d8.rs:91-108`) reads post-`dontCross` `direction`, **both `p` and `sd8`** require cross-seam `dontCross` causality.
   - **Exact tiled solution**: Schedule Pass B tiles in **NW→SE anti-diagonal wavefront order** (`tx + ty = d`, parallelism $\min(M_x, M_y) \ge 8$ on ELC/Tickfaw). Each tile $(tx, ty)$ reads the finalized bottom row of `direction` from $(tx, ty-1)$ and right column from $(tx-1, ty)$ (just $2T$ bytes = 4–8 KB/tile), runs steep + row-major `dontCross`, and streams `-sd8` directly to `GeoTiffWriter`.
+- **WP-S0 finding: `dontCross` does not fire.** In exact arithmetic, a cell and its north (or west) neighbor cannot both choose crossing diagonals in the steep pass. If `A = (x, y-1)` takes SE over E and `B = (x, y)` takes NE over E, with targets `p = (x+1, y-1)`, `q = (x+1, y)` and `r = D/dx > 1`, the two choices need `r p - q > (r-1) z_A` and `r q - p > (r-1) z_B`. Their sum gives `p + q > z_A + z_B`, which contradicts the positive drops `z_A > q` and `z_B > p`; the W/SW case and any row spacing are alike. The transcription in `rust/tests/support/d8_reference.rs` found **no** crossing event, in the steep pass or any flat pass, on the 6.1 suite, on 200,000 random small terrains (including `f32` near-ties and anisotropic cells), and on 3,000 smooth quantized terrains needing up to 3 flat passes. WP-S2 may therefore run the steep pass fully in parallel and keep the wavefront (`tiling::for_each_wavefront`) as a fallback for tiles where a crossing condition is detected, rather than as the default schedule.
 - **Zero-read `fel` halo fusion**: In fused `pipeline`, the 1-cell outer `fel` halo of tile $(tx, ty)$ consists **exclusively of perimeter cells of its 8 adjacent tiles** — whose exact final `fel` elevations are **already in RAM** inside Global Solve 1's `Z_global`! In standalone `d8flowdir`, read `(T+2)×(T+2)` of `fel` directly from the input GeoTIFF instead.
 
 ### 2.3 Stage 2b: Flat Resolution Across Tiles (Hardest Exactness Problem)
@@ -211,6 +223,78 @@ impl TileStore {
 pub struct BorderTable<T: Copy> { /* top/bottom [tile_w], left/right [tile_h], 4 corners per TileId */ }
 ```
 
+**As implemented in WP-S0** (`rust/src/tiling/`, `taudem_rs::tiling`). The sketch above had untyped `put_u8`/`put_f32` methods keyed by a `TileLayer` enum; it is replaced by typed layers that share one cache, budget and scratch file:
+
+```rust
+pub struct TileId { pub tx: u32, pub ty: u32 }            // Ord is row-major (ty, tx)
+pub struct Rect { pub x: usize, pub y: usize, pub width: usize, pub height: usize }
+pub struct HaloWindow { pub core: Rect, pub window: Rect, pub radius: usize,
+                        pub pad_left: usize, pub pad_top: usize, pub pad_right: usize, pub pad_bottom: usize }
+impl HaloWindow {
+    fn buffer_width/buffer_height/buffer_cells(&self) -> usize;
+    fn index(&self, lx: usize, ly: usize) -> u32;          // core cell -> halo-buffer index
+    fn pad_into<T: Copy>(&self, window_data: &[T], fill: T, buffer: &mut Vec<T>) -> Result<()>;
+    fn core_from_buffer<T: Copy>(&self, buffer: &[T], core: &mut Vec<T>) -> Result<()>;
+}
+impl TileSpec {                                            // 64-bit raster dims; (T+2)^2 <= u32::MAX
+    fn new(raster_w, raster_h, tile_w, tile_h) -> Result<Self>;               // exact (forced T=16/17)
+    fn aligned(raster_w, raster_h, target, native_block: Option<(usize, usize)>) -> Result<Self>;
+    fn cells(&self) -> u64;  fn tile_size(&self) -> (usize, usize);  fn tiles_x/tiles_y(&self) -> u32;
+    fn rect(&self, id) -> Rect;  fn halo(&self, id, radius) -> HaloWindow;  fn halo_window(&self, id) -> HaloWindow;
+    fn locate(&self, x, y) -> (TileId, u32);  fn local_index(&self, id, x, y) -> u32;
+    fn global_coords(&self, id, local: u32) -> (usize, usize);  fn neighbor(&self, id, k: 1..=8) -> Option<TileId>;
+    fn index(&self, id) -> usize;  fn id_at(&self, index) -> TileId;  fn is_aligned_to(&self, bw, bh) -> bool;
+    fn row_major(&self) -> impl Iterator<Item = TileId>;  fn morton_order(&self) -> Vec<TileId>;
+    fn wavefront_groups(&self) -> Vec<Vec<TileId>>;        // anti-diagonals tx + ty = d
+}
+/// Runs `visit` on the current Rayon pool, each tile after its W and N neighbors (dependency counting, no barriers).
+pub fn for_each_wavefront<E: Send>(spec: &TileSpec, visit: impl Fn(TileId) -> Result<(), E> + Sync) -> Result<(), E>;
+
+pub struct TileCache;                                      // budget, LRU order, scratch file; Clone shares it
+impl TileCache {
+    fn new(CacheConfig { budget_bytes: u64, scratch_dir: Option<PathBuf> }) -> Self;
+    fn store<T: TileElement>(&self, name: &str, StoreOptions { prefilter: Option<Prefilter>, initial: Tier }) -> TileStore<T>;
+    fn stats(&self) -> TileStats;  fn enforce_budget(&self) -> Result<()>;
+}
+impl<T: TileElement> TileStore<T> {                        // u8 i8 u16 i16 u32 i32 u64 i64 f32 f64; &self, thread-safe
+    fn put(&self, id, data: &[T]) -> Result<()>;  fn put_owned(&self, id, data: Vec<T>) -> Result<()>;
+    fn get_into(&self, id, dst: &mut Vec<T>) -> Result<()>;  fn try_get_into(..) -> Result<bool>;
+    fn get(&self, id) -> Result<Option<Vec<T>>>;  fn take(&self, id) -> Result<Option<Vec<T>>>;  // take: no copy from Tier 0
+    fn remove(&self, id) -> bool;  fn clear(&self);  fn contains/tier/ids/len/elements(..);
+    fn pin(&self, id) -> Result<TilePin<'_, T>>;            // RAII; pinned tiles are never evicted
+    fn evict(&self, id, to: Tier) -> Result<()>;            // explicit compress / spill
+}
+pub enum Tier { Ram, Compressed, Spilled }
+pub enum Prefilter { None, Shuffle, Delta, DeltaShuffle }  // TileElement::DEFAULT_PREFILTER per type
+pub fn encode_tile<T: TileElement>(data: &[T], filter: Prefilter, out: &mut Vec<u8>);
+pub fn decode_tile<T: TileElement>(blob: &[u8], dst: &mut Vec<T>) -> Result<()>;   // verifies checksums
+
+impl<T: Copy + Send + Sync> BorderTable<T> {               // per-tile RwLock; ~2(Tw+Th) values per tile
+    fn new(spec: TileSpec, fill: T) -> Self;
+    fn set_from_tile(&self, id, tile: &[T]) -> Result<()>;  fn set_from_halo(&self, id, &HaloWindow, buffer: &[T]) -> Result<()>;
+    fn read(&self, id) -> RwLockReadGuard<'_, Border<T>>;   // top/bottom/left/right/corner(Corner)/get(lx, ly)
+    fn update<R>(&self, id, f: impl FnOnce(&mut Border<T>) -> R) -> R;
+    fn ring(&self, id, outside: T) -> Ring<T>;              // 1-cell ring from the 8 neighbors' borders
+    fn fill_halo_ring(&self, id, &HaloWindow, buffer: &mut [T], outside: T) -> Result<()>;
+    fn cell(&self, x, y) -> Option<T>;
+}
+
+impl<T: terrio::RasterElement + Default> AsyncTileWriter<T> {   // GeoTiffWriter owned by one background thread
+    fn create(path, &RasterDataset, &RasterWriteOptions /* tile_size required */, queue_depth) -> Result<Self>;
+    fn from_writer(GeoTiffWriter, queue_depth) -> Result<Self>;
+    fn sink(&self) -> TileSink<T>;                          // Clone + Send + Sync handle for compute threads
+    fn submit_block(&self, col, row, data: &[T]) -> Result<()>;    // compress on caller (TileEncoder), bounded send
+    fn submit_region(&self, rect: Rect, data: &[T]) -> Result<()>; // any compute tile; partial blocks assembled
+    fn finish(self) -> Result<WriterStats>;
+}
+
+pub struct ExecutionOptions { pub mode: ExecutionMode, pub max_memory: Option<u64>, pub tile_size: Option<usize>, pub scratch_dir: Option<PathBuf> }
+// memory_budget(), scratch_dir(), tile_spec(w, h, native_block), cache_config(budget); default_memory_budget();
+// tiling::memory::{usable_memory, available_memory, process_memory}
+```
+
+Test support for WP-S1..S3 lives in `rust/tests/support/` (`mod support;` from an integration test): `fixtures::suite(T)` and `large_suite()`; `harness::{TiledStage, stage(..), compare, assert_tiled_matches_in_memory(stage, fixture, tile_size, threads), assert_suite(stage, &TILE_SIZES, &THREADS)}`; `harness::reference::{fel, d8, directions, ad8}`; and `d8_reference`, a transcription of `d8.rs` that can disable and record `dontCross`.
+
 ### 3.2 Tile Size Selection, `TileStore` Tiers & Memory Budget (`--max-memory`)
 - **Tile size (`--tile-size`, auto-aligned to native `block_size`, typically 256×256)**:
   - **$T = 2048$** ($4.19\text{M}$ cells, $8\times 8$ native blocks) when `budget <= 8 GiB` or `cells < 5e8`: active 8-thread RAM ~340 MB; 288 tiles on ELC, 966 on Tickfaw; `u8` dir (4 MB) + `u16` label (8 MB) fit in L3 cache.
@@ -219,6 +303,9 @@ pub struct BorderTable<T: Copy> { /* top/bottom [tile_w], left/right [tile_h], 4
 - **Budget resolution (`--max-memory <bytes>`, `--scratch-dir <path>`, `--mode auto|memory|stream`)**:
   - Default budget: `min(0.65 * terrio::usable_memory(), 0.75 * avail_ram)` (fallback `4 GiB` if unavailable).
   - Reserve `R_work = threads * tile_scratch_bytes + perimeter_graph_bytes + writer_channel_bytes`; remaining `B_cache` bounds `TileStore`.
+  - *As implemented*: `--mode auto|in-memory|tiled` (not `memory|stream`); `--max-memory` takes `4G`, `512M`, `1.5GiB` (binary units). The default is `min(0.65 * usable, 0.75 * available)`, where `tiling::memory::usable_memory()` is `terrio::usable_memory()` or, where that is `None` (Windows today), the total physical memory from `GlobalMemoryStatusEx` capped by the virtual address space; `available` is `ullAvailPhys` or `MemAvailable`. An explicit `--tile-size` is used exactly; the automatic size is aligned to native blocks.
+  - *Measured* (`rust/examples/tile_codec_bench.rs`, Muncie LiDAR 7892 x 4538, 1024^2 tiles, one thread on a busy CLB-08; the clip's nodata flatters the ratios): `fel` f32 shuffle **0.353 B/cell** (11.3x; 2.0 GB/s compress, 2.7 GB/s decompress; raw LZ4 0.490); `p` u8 raw **0.464 B/cell**; `p` i16 shuffle 0.468 (delta 0.738, so 16-bit types default to shuffle, not delta); `ad8` f32 shuffle 1.49 (raw 1.63); BFS-distance u32 delta **0.018 B/cell**. Blobs are 1 MiB chunks compressed independently (bounded per-thread scratch) behind a 64-byte header with the element type, the tile key and xxHash64-style checksums of header and payload.
+  - *Measured budget*: under a forced 64 MiB budget, 768 MiB of tiles from 8 threads (two rounds of put and verified get) peaked at 69.6 MiB of accounted tiles and 101 MiB of working-set growth, against a bound of budget + 8 x 4 tiles of working buffers = 128 MiB; 325 tiles were spilled (`rust/tests/tile_store_stress.rs`).
   - **Tier 1 (Compressed-RAM via `lz4_flex`)**: Pure Rust, >15 GB/s aggregate across 8 cores with dtype prefilters:
     - `Dir` (`u8`): raw LZ4 → **~0.35–0.45 B/cell** (ELC ~450 MB, Tickfaw ~1.6 GiB).
     - `Fel` (`f32`): 4-plane byte shuffle + LZ4 → **~0.7–1.2 B/cell**.
@@ -303,10 +390,12 @@ Each work package (WP) is sized for **one implementation agent**.
 Run every synthetic fixture with forced tiny tile sizes (`T = 16, 17, 32` — including prime/non-multiple widths) at `1` and `8` threads and assert **0 cell differences** against the in-memory reference:
 1. **Cross-seam & 4-corner pits**: Deep pit centered on a 4-tile corner whose sole spill saddle lies 3 tiles away along a winding 1-cell diagonal channel (both 8-way and `-4`); pit drained by an interior `-depmask` cell in a neighboring tile.
 2. **Nodata at tile edges/corners**: Single nodata cell on an adjacent tile's seam or diagonal corner (must act as PitRemove outlet, D8 nodata mask, and AreaD8 contamination source across the seam).
-3. **`dontCross` cascades across seams**: Diagonal-tie checkerboard crossing horizontal and vertical tile boundaries, asserting both `p` and `sd8` match single-threaded row-major scanline order bit-for-bit.
+3. **`dontCross` cascades across seams**: Diagonal-tie checkerboard crossing horizontal and vertical tile boundaries, asserting both `p` and `sd8` match single-threaded row-major scanline order bit-for-bit. *(WP-S0: the fixtures put hundreds of `ORDER` tie-break cells and flat cells on tile edges, but no terrain found makes the crossing rule fire; see 2.2.)*
 4. **Multi-tile flats & multi-iteration secondary flats**: L-shaped and spiral flats spanning $3\times 3$ tiles; flat bordering nodata across a seam (`fall = 2` seed); adjacent flats of different elevation blocked by `dontCross` (exercises `incrise` cross-elevation BFS); wide plateau triggering Garbrecht–Martz Iter 2 & 3 (`artificial`).
 5. **Cross-tile meandering rivers, coarse tile cycles, & `k==4` quirk**: River exiting tile A → B → C → back into A → B (verifying perimeter-cell DAG solves despite cycles in the tile graph); unresolved flat (`p == 0`) at a tile corner blocking its SE neighbor in the diagonally adjacent tile (`k == 4 && other == 0`, tested with and without `-nc`); synthetic $>1.7\times 10^7$-cell narrow ramp crossing tiles to test the $2^{24}$ `f32` precision boundary.
 6. **Non-multiple & degenerate geometries**: `100 × 67` with `T = 32`, 1-tile rasters, 1-row/1-column strips, and all-nodata sparse tiles (`SPARSE_OK` skip on read & write).
+
+*WP-S0 status*: `rust/tests/support/fixtures.rs` generates all six categories for any `T >= 16` (`suite(T)`: 28 fixtures, 25 DEMs and 3 D8-code grids for AreaD8, including `-4`, `-depmask` and `-nc` variants). `large_suite()` adds the 4201 x 4200 ramp whose in-memory mainstem outlet is 17,610,416 against an exact 17,610,612 (f32 rounding above 2^24). `rust/tests/adversarial.rs` checks each fixture's feature, checks that stages routed through `TileStore`/`BorderTable` pass the harness at T = 16/17/32 and 1/8 threads, and checks that tile-local stages fail it in every category.
 
 ---
 

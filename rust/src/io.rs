@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{error::Error, path::Path};
+use std::{error::Error, path::Path, sync::RwLock};
 
-use taudem_rs::{DIRECTION_NODATA, Grid, INVALID_DIRECTION};
+use taudem_rs::pitremove_tiled::SolvedPitRemove;
+use taudem_rs::tiling::{self, AsyncTileWriter, HaloWindow, Rect, TileSpec};
+use taudem_rs::{DIRECTION_NODATA, FEL_NODATA, Grid, INVALID_DIRECTION};
 use terrio::raster::RasterData;
 use terrio::{
     DataType, Error as TerrioError, GeoTiffWriter, LazyRaster, RasterDataset, RasterWriteOptions,
-    TiffReadLimits, Window, WindowOptions, open_raster_lazy,
+    TiffReadLimits, TiffSample, Window, WindowOptions, open_raster_lazy,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -18,7 +20,6 @@ const TILE: usize = 256;
 pub struct Raster {
     input: LazyRaster,
     pub header: RasterDataset,
-    pub grid: Grid,
 }
 
 impl Raster {
@@ -27,8 +28,6 @@ impl Raster {
         if input.band_count() == 0 || input.is_complex() {
             return Err(format!("{path} must have a real-valued raster band").into());
         }
-        let grid = Grid::new(input.width(), input.height())
-            .ok_or("raster exceeds the 32-bit cell index limit")?;
         let mut header = input.header();
         header.raster.bands = 1;
         // Derived products inherit spatial metadata, but not source band
@@ -40,11 +39,24 @@ impl Raster {
         header.metadata_domains.clear();
         header.band_metadata.clear();
         header.color_table.clear();
-        Ok(Self {
-            input,
-            header,
-            grid,
-        })
+        Ok(Self { input, header })
+    }
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.input.width(), self.input.height())
+    }
+
+    pub fn grid(&self) -> Result<Grid> {
+        let (width, height) = self.dimensions();
+        Grid::new(width, height).ok_or_else(|| "raster exceeds the 32-bit cell index limit".into())
+    }
+
+    pub fn block_size(&self) -> Option<(usize, usize)> {
+        self.input.block_size()
+    }
+
+    pub fn tile_reader(&mut self) -> tiling::Result<WindowReader<'_>> {
+        WindowReader::new(&mut self.input)
     }
 
     pub fn nodata(&self) -> f32 {
@@ -84,7 +96,7 @@ impl Raster {
     }
 
     pub fn check_mask(&self, mask: &Self) -> Result<()> {
-        if self.grid != mask.grid
+        if self.dimensions() != mask.dimensions()
             || self.input.geo_transform() != mask.input.geo_transform()
             || self.header.raster.crs != mask.header.raster.crs
         {
@@ -194,16 +206,11 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
     if !is_tiff(path) {
         return Err(format!("GeoTIFF output requires a .tif or .tiff extension: {path}").into());
     }
-    let mut header = header.clone();
     let (data_type, nodata, predictor) = match product {
         Product::Float(_, nd) | Product::FloatRows(_, nd) => (DataType::F32, f64::from(nd), "3"),
         Product::Direction(_) => (DataType::I16, f64::from(P_NODATA), "2"),
     };
-    header.raster.data_type = data_type;
-    header.raster.data = RasterData::new_filled(data_type, 0, 0.0);
-    header.raster.nodata = nodata;
-    header.has_nodata = true;
-    header.band_nodata.clear();
+    let header = output_header(header, data_type, nodata);
     let width = header.raster.cols;
     let rows = header.raster.rows;
     let options = RasterWriteOptions {
@@ -265,4 +272,174 @@ fn is_tiff(path: &str) -> bool {
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+}
+
+fn output_header(header: &RasterDataset, data_type: DataType, nodata: f64) -> RasterDataset {
+    let mut header = header.clone();
+    header.raster.data_type = data_type;
+    header.raster.data = RasterData::new_filled(data_type, 0, 0.0);
+    header.raster.nodata = nodata;
+    header.has_nodata = true;
+    header.band_nodata.clear();
+    header
+}
+
+pub fn fel_block_size(spec: TileSpec) -> usize {
+    let (w, h) = spec.tile_size();
+    [256, 128, 64, 32, 16]
+        .into_iter()
+        .find(|&block| {
+            (spec.tiles_x() == 1 || w.is_multiple_of(block))
+                && (spec.tiles_y() == 1 || h.is_multiple_of(block))
+        })
+        .unwrap_or(16)
+}
+
+pub fn fel_writer(
+    path: &str,
+    header: &RasterDataset,
+    spec: TileSpec,
+) -> tiling::Result<AsyncTileWriter<f32>> {
+    if !is_tiff(path) {
+        return Err(tiling::Error::Invalid(format!(
+            "GeoTIFF output requires a .tif or .tiff extension: {path}"
+        )));
+    }
+    let header = output_header(header, DataType::F32, f64::from(FEL_NODATA));
+    let options = RasterWriteOptions {
+        compression: Some("DEFLATE".into()),
+        tile_size: Some(fel_block_size(spec) as u32),
+        creation_options: vec![
+            ("PREDICTOR".into(), "3".into()),
+            ("ZLEVEL".into(), "1".into()),
+            ("SPARSE_OK".into(), "YES".into()),
+        ],
+        ..Default::default()
+    };
+    AsyncTileWriter::create(path, &header, &options, 8)
+}
+
+pub fn write_fel_tiles(
+    solved: SolvedPitRemove,
+    writer: AsyncTileWriter<f32>,
+) -> tiling::Result<taudem_rs::pitremove_tiled::PitRemoveStats> {
+    let stats = solved.emit(|tile| writer.submit_region(tile.halo.core, tile.core))?;
+    let write = writer.finish()?;
+    write.record_profile("fel");
+    Ok(stats)
+}
+
+/// Shared caller-buffer reads for ordinary TIFF layouts. Only layouts that
+/// require Terrio's owned-window path take the exclusive decoder lock.
+pub struct WindowReader<'a> {
+    input: RwLock<&'a mut LazyRaster>,
+    dtype: DataType,
+    strip_rows: Option<(usize, usize)>,
+}
+
+impl<'a> WindowReader<'a> {
+    fn new(input: &'a mut LazyRaster) -> tiling::Result<Self> {
+        let dtype = input.band_data_type(1);
+        let (block, strip_height) = input.block_size().unwrap_or((0, 0));
+        let row_bytes = input.width() * input.data_type().size_bytes() * input.band_count();
+        let max_rows = TiffReadLimits::from_config()?.chunk_bytes / row_bytes;
+        let strip_rows = (block == input.width() && max_rows < strip_height.min(input.height()))
+            .then_some((max_rows.max(1), strip_height));
+        Ok(Self {
+            input: RwLock::new(input),
+            dtype,
+            strip_rows,
+        })
+    }
+
+    pub fn halo(&self, halo: HaloWindow, values: &mut [f32]) -> tiling::Result<()> {
+        let width = halo.buffer_width();
+        // Pack the reads at the front. Move rows backwards to make space
+        // for clipped padding without allocating a second elevation window.
+        self.samples(halo.window, &mut values[..halo.window.cells()], |z| {
+            z as f32
+        })?;
+        for row in (0..halo.window.height).rev() {
+            let src = row * halo.window.width;
+            let dest = (row + halo.pad_top) * width + halo.pad_left;
+            values.copy_within(src..src + halo.window.width, dest);
+        }
+        Ok(())
+    }
+
+    pub fn mask(&self, rect: Rect, mask: &mut [u8]) -> tiling::Result<()> {
+        self.samples(rect, mask, |z| u8::from(z.round() == 1.0))
+    }
+
+    fn samples<T: TiffSample + Default>(
+        &self,
+        rect: Rect,
+        output: &mut [T],
+        convert: impl Fn(f64) -> T,
+    ) -> tiling::Result<()> {
+        if self.strip_rows.is_none() {
+            let input = self.input.read().map_err(|_| lock_error())?;
+            let window = rect.terrio_window();
+            macro_rules! typed {
+                ($ty:ty) => {{
+                    let mut native = vec![0 as $ty; output.len()];
+                    input
+                        .read_geotiff_samples_into(window, 1, None, &mut native)
+                        .map(|()| {
+                            for (out, z) in output.iter_mut().zip(native) {
+                                *out = convert(z as f64);
+                            }
+                        })
+                }};
+            }
+            let direct = if self.dtype == DataType::F32 && T::DATA_TYPE == DataType::F32 {
+                input.read_geotiff_samples_into(window, 1, None, output)
+            } else {
+                match self.dtype {
+                    DataType::U8 => typed!(u8),
+                    DataType::I8 => typed!(i8),
+                    DataType::U16 => typed!(u16),
+                    DataType::I16 => typed!(i16),
+                    DataType::U32 => typed!(u32),
+                    DataType::I32 => typed!(i32),
+                    DataType::U64 => typed!(u64),
+                    DataType::I64 => typed!(i64),
+                    DataType::F32 => typed!(f32),
+                    DataType::F64 => typed!(f64),
+                }
+            };
+            match direct {
+                Ok(()) => return Ok(()),
+                Err(TerrioError::Unsupported(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut input = self.input.write().map_err(|_| lock_error())?;
+        let options = WindowOptions {
+            bands: vec![1],
+            ..Default::default()
+        };
+        let mut y = rect.y;
+        while y < rect.bottom() {
+            let mut rows = rect.bottom() - y;
+            if let Some((max_rows, strip_height)) = self.strip_rows {
+                rows = rows.min(max_rows).min(strip_height - y % strip_height);
+            }
+            let data =
+                input.read_geotiff_samples(Window::new(rect.x, y, rect.width, rows), &options)?;
+            let offset = (y - rect.y) * rect.width;
+            for (i, out) in output[offset..offset + rows * rect.width]
+                .iter_mut()
+                .enumerate()
+            {
+                *out = convert(data.get_f64(i));
+            }
+            y += rows;
+        }
+        Ok(())
+    }
+}
+
+fn lock_error() -> tiling::Error {
+    tiling::Error::Invalid("the GeoTIFF window decoder lock was poisoned".into())
 }

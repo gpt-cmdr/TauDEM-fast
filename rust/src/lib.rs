@@ -4,7 +4,9 @@
 mod area;
 mod d8;
 mod flood;
+pub mod pitremove_tiled;
 pub mod profile;
+pub mod tiling;
 
 pub use area::area_d8;
 pub use d8::{D8Result, SteepFlow, Surface, d8_flow, d8_steep};

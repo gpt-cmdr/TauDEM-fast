@@ -6,5 +6,9 @@ rust-version = "1.94"
 license = "GPL-3.0-only"
 
 [dependencies]
+lz4_flex = { version = "0.14.2", default-features = false, features = ["std", "safe-decode"] }
 rayon = "1.12"
 terrio = { git = "https://github.com/CLB-Engineering-Corporation/terrio", branch = "taudem-integration", default-features = false, features = ["geotiff"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

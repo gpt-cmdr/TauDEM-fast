@@ -36,10 +36,26 @@ uses Terrio's row-based decoder when available. Compressed strips may be
 decoded from the start for each window. For trusted inputs that still hit the
 limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 
+Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
+BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
+of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
+the system temporary directory). PitRemove supports out-of-core execution
+with `--mode tiled`. Auto mode selects it when the in-memory estimate
+(8 bytes per cell, or 9 with `-depmask`) exceeds the budget or the raster
+exceeds the in-memory index limit. An explicit tile side can be 16 through
+4096 if its working buffers and perimeter fit the budget.
+
+Tiled PitRemove reads a halo around each tile, retains local fills and
+watershed labels in the budgeted `TileStore`, and writes the result as a
+sparse tiled GeoTIFF. The `pitremove_tiled::PitRemovePlan` library API takes a
+window reader and returns a solved flood. `SolvedPitRemove::emit` supplies
+filled cores and their exact one-cell halos directly to a concurrent
+consumer. See `docs/rust-port/STREAMING.md` section 3 for the tile infrastructure.
+
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and out-of-core processing are future work.
+directions (`-sfdr`), and out-of-core D8FlowDir, AreaD8, and pipeline are future work.
 
 ## Memory and threads
 
@@ -81,3 +97,15 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
   AreaD8 walks downstream from headwater cells in parallel; the walk that
   completes a cell's last upstream neighbor sums it, adding upstream areas in
   TauDEM's fixed neighbor order, so the sums are identical for any schedule.
+
+## Tests for tiled stages
+
+`tests/support/` generates the tiling-boundary fixtures of
+`docs/rust-port/STREAMING.md` section 6.1 for a tile size and provides
+`assert_tiled_matches_in_memory`; include it with `mod support;`.
+`cargo test --release --test adversarial -- --ignored` also runs the
+17.6-million-cell AreaD8 ramp. To check the background writer's GeoTIFFs
+with GDAL, run `TAUDEM_GDAL_CHECK_DIR=DIR cargo test --test async_writer`,
+then `python tests/gdal_readback.py DIR` with GDAL's Python bindings.
+`cargo run --release --example tile_codec_bench -- DEM.tif [TILE]` reports
+the tile codec's compression ratios and speeds on a Float32 DEM.
