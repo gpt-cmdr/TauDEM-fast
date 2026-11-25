@@ -41,6 +41,20 @@ to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
 directions (`-sfdr`), and out-of-core processing are future work.
 
+## Memory and threads
+
+PitRemove and flat routing run on all `RAYON_NUM_THREADS` workers, and the
+results do not depend on the thread count. The fused pipeline peaks at
+about 9 to 10 bytes per cell, during flat routing: the filled grid (4),
+directions (1), both flat increment fields packed in one 32-bit word per cell
+(4), and the search frontiers. PitRemove holds the grid, 16-bit tile labels
+(2) and small per-tile buffers; AreaD8 holds directions, a state byte and the
+area grid (6). The CLI streams sd8 to disk in row blocks before routing flats
+and then reuses the filled grid as the flats' artificial surface, so neither
+needs its own grid. Flat increments use 16-bit halves. A pass whose
+breadth-first distance inside a flat would exceed 65,533 cells repeats with
+32-bit halves (8 bytes per cell).
+
 ## Algorithm sources
 
 - PitRemove implements improved Priority-Flood with a FIFO for flooded cells.
@@ -59,4 +73,8 @@ directions (`-sfdr`), and out-of-core processing are future work.
   `pit_remove_with_tiles` selects the tile side, or the whole-grid flood with 0.
 - D8FlowDir and AreaD8 follow TauDEM's `src/d8.cpp`, `src/aread8.cpp` and
   `src/commonLib.cpp` by David Tarboton and contributors. The flat resolver
-  replaces repeated scans with breadth-first traversals of each gradient.
+  computes TauDEM's Garbrecht–Martz increments as breadth-first distances
+  instead of repeated scans, with level-synchronous parallel searches; the
+  distances, and so the directions, do not depend on visit order. The
+  crossing rule is checked in parallel and only crossing cells, and cells
+  whose north or west neighbor then changes, are revisited in row-major order.

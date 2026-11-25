@@ -7,7 +7,7 @@ mod flood;
 pub mod profile;
 
 pub use area::area_d8;
-pub use d8::{D8Result, d8_flow};
+pub use d8::{D8Result, SteepFlow, Surface, d8_flow, d8_steep};
 pub use flood::{MAX_TILE, pit_remove, pit_remove_with_tiles};
 
 pub const FEL_NODATA: f32 = -3.0e38;
@@ -125,19 +125,20 @@ pub fn pipeline(
         options.four_way,
         options.mask,
     );
-    let flow = d8_flow(
-        grid,
-        &elevations,
-        FEL_NODATA,
-        options.spacing,
-        options.retain.slope,
-    );
-    let filled = options.retain.filled.then_some(elevations);
-    let area = area_d8(grid, &flow.direction, options.check_contamination);
+    let steep = d8_steep(grid, &elevations, FEL_NODATA, options.spacing);
+    let slope = options.retain.slope.then(|| steep.slope(&elevations));
+    // Flat routing reuses the filled grid as scratch unless it is retained.
+    let (direction, filled) = if options.retain.filled {
+        let direction = steep.resolve_flats(Surface::Borrowed(&elevations));
+        (direction, Some(elevations))
+    } else {
+        (steep.resolve_flats(Surface::Owned(elevations)), None)
+    };
+    let area = area_d8(grid, &direction, options.check_contamination);
     PipelineResult {
         filled,
-        direction: options.retain.direction.then_some(flow.direction),
-        slope: flow.slope,
+        direction: options.retain.direction.then_some(direction),
+        slope,
         area,
     }
 }

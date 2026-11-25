@@ -185,6 +185,8 @@ impl Raster {
 
 pub enum Product<'a> {
     Float(&'a [f32], f32),
+    /// Float rows produced on demand: `fill(first_row, rows)` writes whole rows.
+    FloatRows(&'a (dyn Fn(usize, &mut [f32]) + Sync), f32),
     Direction(&'a [u8]),
 }
 
@@ -194,7 +196,7 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
     }
     let mut header = header.clone();
     let (data_type, nodata, predictor) = match product {
-        Product::Float(_, nd) => (DataType::F32, f64::from(nd), "3"),
+        Product::Float(_, nd) | Product::FloatRows(_, nd) => (DataType::F32, f64::from(nd), "3"),
         Product::Direction(_) => (DataType::I16, f64::from(P_NODATA), "2"),
     };
     header.raster.data_type = data_type;
@@ -219,6 +221,19 @@ pub fn write(path: &str, header: &RasterDataset, product: Product<'_>) -> Result
             for stripe in values.chunks(width * TILE) {
                 writer.write_rows_slice(stripe, stripe.len() / width, None)?;
             }
+        }
+        Product::FloatRows(fill, _) => {
+            let mut stripe = vec![0.0f32; width * rows.min(TILE)];
+            let mut producing = std::time::Duration::ZERO;
+            for first in (0..rows).step_by(TILE) {
+                let count = (rows - first).min(TILE);
+                let stripe = &mut stripe[..count * width];
+                let start = std::time::Instant::now();
+                fill(first, stripe);
+                producing += start.elapsed();
+                writer.write_rows_slice(stripe, count, None)?;
+            }
+            taudem_rs::profile::count("write.rows_produce_us", producing.as_micros() as u64);
         }
         Product::Direction(values) => {
             // The kernels store byte directions. Convert to TauDEM's Int16

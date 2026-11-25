@@ -11,7 +11,7 @@ use std::{
 
 use io::{Product, Raster, Result, write};
 use taudem_rs::profile::{self, CountingAlloc};
-use taudem_rs::{FEL_NODATA, SCALAR_NODATA, area_d8, d8_flow, pit_remove};
+use taudem_rs::{FEL_NODATA, SCALAR_NODATA, Surface, area_d8, d8_steep, pit_remove};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -172,35 +172,38 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         if command != "pitremove" {
             let start = Instant::now();
-            let span = profile::span("d8flowdir");
-            let flow = d8_flow(
+            let span = profile::span("d8flowdir.steep");
+            let steep = d8_steep(
                 raster.grid,
                 &elevations,
                 if fill { FEL_NODATA } else { nodata },
                 &spacing,
-                options.contains_key("-sd8"),
             );
-            drop(elevations);
             drop(span);
-            timings.stage("D8FlowDir", start);
+            let mut compute = start.elapsed();
+            // TauDEM writes sd8 before routing flats. Streaming it by rows here
+            // keeps a whole-grid slope buffer out of memory.
             output(
                 &mut timings,
                 &raster,
-                "-p",
-                Product::Direction(&flow.direction),
+                "-sd8",
+                Product::FloatRows(
+                    &|row, out: &mut [f32]| steep.slope_rows(&elevations, row, out),
+                    SCALAR_NODATA,
+                ),
             )?;
-            if let Some(slope) = flow.slope {
-                output(
-                    &mut timings,
-                    &raster,
-                    "-sd8",
-                    Product::Float(&slope, SCALAR_NODATA),
-                )?;
-            }
+            let start = Instant::now();
+            let span = profile::span("d8flowdir.flats");
+            // The filled grid is no longer needed and becomes flat scratch.
+            let direction = steep.resolve_flats(Surface::Owned(elevations));
+            drop(span);
+            compute += start.elapsed();
+            timings.add("D8FlowDir", compute);
+            output(&mut timings, &raster, "-p", Product::Direction(&direction))?;
             if command == "pipeline" {
                 let start = Instant::now();
                 let span = profile::span("aread8");
-                let area = area_d8(raster.grid, &flow.direction, check_contamination);
+                let area = area_d8(raster.grid, &direction, check_contamination);
                 drop(span);
                 timings.stage("AreaD8", start);
                 output(
@@ -260,7 +263,10 @@ struct Timings {
 
 impl Timings {
     fn stage(&mut self, name: &str, start: Instant) {
-        let elapsed = start.elapsed();
+        self.add(name, start.elapsed());
+    }
+
+    fn add(&mut self, name: &str, elapsed: Duration) {
         self.compute += elapsed;
         println!("{name} compute time: {:.6}", elapsed.as_secs_f64());
     }
