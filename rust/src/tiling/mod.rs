@@ -20,6 +20,7 @@ mod border;
 mod codec;
 mod spec;
 mod store;
+mod writer;
 
 pub use border::{Border, BorderTable, Corner, Ring};
 pub use codec::{
@@ -27,6 +28,7 @@ pub use codec::{
 };
 pub use spec::{HaloWindow, Rect, TileId, TileSpec, for_each_wavefront};
 pub use store::{CacheConfig, StoreOptions, Tier, TileCache, TilePin, TileStats, TileStore};
+pub use writer::{AsyncTileWriter, TileSink, WriterStats};
 
 use std::fmt;
 
