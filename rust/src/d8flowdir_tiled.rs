@@ -76,8 +76,11 @@ pub fn run(
     let workers = threads as u64 * ((tw + 2) * (th + 2)) as u64 * (WORK_BYTES_PER_CELL + 4);
     let borders = spec.tile_count() as u64 * 2 * (tw + th) as u64 * 40;
     let queues = 2 * 4 * threads as u64 * 256 * 256 * 4;
+    // The process itself (code, thread stacks, the reader's decode buffers,
+    // allocator slack) takes the rest.
+    let reserve = (48 << 20) + budget / 16;
     let cache_budget = budget
-        .saturating_sub(workers + borders + queues)
+        .saturating_sub(workers + borders + queues + reserve)
         .max(budget / 8);
     let cache = TileCache::new(execution.cache_config(cache_budget));
     profile::count("d8.tiled.tile_width", tw as u64);
@@ -169,6 +172,18 @@ fn report(spec: &TileSpec, stats: &D8TileStats, cache: &TileCache) {
         stats.deferred_cells,
         stats.deferred_tiles,
         stats.passes.len()
+    );
+    let c = &stats.components;
+    println!(
+        "Tiled D8 edge flats: {} components ({} cells), {} across tiles ({} cells);          largest {} cells, widest over {} tiles ({} x {})",
+        c.components,
+        c.cells,
+        c.cross_tile,
+        c.cross_tile_cells,
+        c.max_cells,
+        c.max_tiles,
+        c.max_tiles_across,
+        c.max_tiles_down
     );
     for (i, p) in stats.passes.iter().enumerate() {
         println!(

@@ -325,6 +325,7 @@ fn mixed_components_use_the_raster_wide_fall_level() {
 /// Every Pass C flat pass is counted, and the counters add up.
 #[test]
 fn stats_account_for_every_flat_cell() {
+    let (mut multi_pass, mut multi_round, mut wide) = (false, false, false);
     for f in suite(16) {
         let Some(dem) = f.dem_values() else {
             continue;
@@ -353,5 +354,14 @@ fn stats_account_for_every_flat_cell() {
             assert_eq!(pair[0].remaining, pair[1].cells, "{}", f.name);
         }
         assert_eq!(s.passes.last().map_or(0, |p| p.remaining), 0);
+        let c = &s.components;
+        assert_eq!(c.cells, s.deferred_cells, "{}", f.name);
+        assert!(c.cross_tile <= c.components && c.cross_tile_cells <= c.cells);
+        multi_pass |= s.passes.len() >= 3;
+        multi_round |= s.passes.iter().any(|p| p.rounds >= 3);
+        wide |= c.max_tiles >= 6 && c.max_tiles_across >= 3 && c.max_tiles_down >= 3;
     }
+    // The suite exercises several flat passes, several relaxation rounds
+    // and components spanning 3 x 3 tiles.
+    assert!(multi_pass && multi_round && wide);
 }

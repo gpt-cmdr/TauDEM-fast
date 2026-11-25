@@ -109,8 +109,28 @@ pub struct D8TileStats {
     pub mixed_components: u64,
     /// Directions changed by the crossing rule (wavefront schedule).
     pub crossing_fixes: u64,
+    /// The flat components reaching a tile edge.
+    pub components: ComponentStats,
     /// Pass C, one entry per flat pass.
     pub passes: Vec<PassStats>,
+}
+
+/// The 8-connected flat components that reach a tile edge (and so cannot
+/// be routed inside one tile).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ComponentStats {
+    /// Components and their cells.
+    pub components: u64,
+    pub cells: u64,
+    /// Components spanning more than one tile, and their cells.
+    pub cross_tile: u64,
+    pub cross_tile_cells: u64,
+    /// The largest component by cells, and the most tiles one spans with
+    /// the extent of its tile bounding box.
+    pub max_cells: u64,
+    pub max_tiles: u64,
+    pub max_tiles_across: u64,
+    pub max_tiles_down: u64,
 }
 
 impl D8TileStats {
@@ -126,6 +146,12 @@ impl D8TileStats {
         count("d8.tiled.mixed_components", self.mixed_components);
         count("d8.crossing_fixes", self.crossing_fixes);
         count("d8.tiled.passes", self.passes.len() as u64);
+        let c = &self.components;
+        count("d8.tiled.edge_components", c.components);
+        count("d8.tiled.cross_tile_components", c.cross_tile);
+        count("d8.tiled.cross_tile_cells", c.cross_tile_cells);
+        count("d8.tiled.max_component_cells", c.max_cells);
+        count("d8.tiled.max_component_tiles", c.max_tiles);
         let total = |f: fn(&PassStats) -> u64| self.passes.iter().map(f).sum::<u64>();
         count("d8.tiled.rounds", total(|p| p.rounds));
         count("d8.tiled.relax_loads", total(|p| p.relax_loads));
@@ -582,6 +608,10 @@ pub struct TiledD8 {
     fall: BorderTable<u32>,
     rise: BorderTable<u32>,
     layers: Layers,
+    /// The labels of perimeter flat components and each tile's component
+    /// sizes, for [`ComponentStats`].
+    labels: BorderTable<u32>,
+    sizes: Vec<Mutex<Vec<u64>>>,
     /// Unresolved cells each tile leaves to Pass C.
     deferred: Vec<AtomicU64>,
     /// Each tile's highest fall and rise levels in the current pass.
@@ -621,6 +651,8 @@ impl TiledD8 {
                 fall: cache.store("d8.fall", StoreOptions::default()),
                 rise: cache.store("d8.rise", StoreOptions::default()),
             },
+            labels: BorderTable::new(spec, 0),
+            sizes: (0..tiles).map(|_| Mutex::new(Vec::new())).collect(),
             deferred: (0..tiles).map(|_| AtomicU64::new(0)).collect(),
             tile_max: (0..tiles).map(|_| AtomicU64::new(0)).collect(),
             interior: Mutex::new(Vec::new()),
@@ -705,7 +737,21 @@ impl TiledD8 {
         }
         self.counters.tiles.fetch_add(1, Relaxed);
 
-        let (flats, edge) = classify(&frame, &s.dirs, &mut s.class, &mut s.cur);
+        let mut sizes = Vec::new();
+        let (flats, edge) = classify(
+            &frame,
+            &s.dirs,
+            &mut s.class,
+            &mut s.fall,
+            &mut sizes,
+            &mut s.cur,
+        );
+        if !sizes.is_empty() {
+            self.labels.set_from_halo(id, &halo, &s.fall)?;
+            *self.sizes[self.spec.index(id)]
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = sizes;
+        }
         self.counters.flat_cells.fetch_add(flats, Relaxed);
         let mut deferred = edge;
         if flats > edge {
@@ -859,6 +905,7 @@ impl TiledD8 {
             deferred_tiles: c.deferred_tiles.load(Relaxed),
             mixed_components: c.mixed.load(Relaxed),
             crossing_fixes: c.crossing_fixes.load(Relaxed),
+            components: self.component_stats(),
             passes: Vec::new(),
         };
         let interior = self
@@ -938,6 +985,115 @@ impl TiledD8 {
             check_exact(t + 1, m[0], m[1])?;
         }
         Ok(D8Outcome::Done(stats))
+    }
+
+    /// Joins the perimeter components of neighboring tiles.
+    fn component_stats(&self) -> ComponentStats {
+        let spec = &self.spec;
+        let sizes: Vec<Vec<u64>> = self
+            .sizes
+            .iter()
+            .map(|m| m.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            .collect();
+        let mut offset = Vec::with_capacity(sizes.len() + 1);
+        offset.push(0usize);
+        for s in &sizes {
+            offset.push(offset.last().unwrap() + s.len());
+        }
+        let nodes = *offset.last().unwrap();
+        let mut parent: Vec<usize> = (0..nodes).collect();
+        fn root(parent: &mut [usize], mut a: usize) -> usize {
+            while parent[a] != a {
+                parent[a] = parent[parent[a]];
+                a = parent[a];
+            }
+            a
+        }
+        for id in spec.row_major() {
+            let t = spec.index(id);
+            if sizes[t].is_empty() {
+                continue;
+            }
+            let labels = Around::new(&self.labels, id, 0);
+            let rect = spec.rect(id);
+            let frame = Frame::new(rect.width, rect.height);
+            for (lx, ly) in frame.perimeter() {
+                let (x, y) = (lx as isize, ly as isize);
+                let a = labels.at(x, y);
+                if a == 0 {
+                    continue;
+                }
+                for k in 1..9 {
+                    if frame.inside(lx, ly, k) {
+                        continue;
+                    }
+                    let (nx, ny) = (x + DX[k], y + DY[k]);
+                    let b = labels.at(nx, ny);
+                    if b == 0 {
+                        continue;
+                    }
+                    let sx = if nx < 0 {
+                        -1
+                    } else {
+                        isize::from(nx >= labels.w)
+                    };
+                    let sy = if ny < 0 {
+                        -1
+                    } else {
+                        isize::from(ny >= labels.h)
+                    };
+                    let side = (1..9)
+                        .find(|&d| DX[d] == sx && DY[d] == sy)
+                        .expect("a side");
+                    let other = spec.neighbor(id, side).expect("a neighbor tile");
+                    let u = root(&mut parent, offset[t] + a as usize - 1);
+                    let v = root(&mut parent, offset[spec.index(other)] + b as usize - 1);
+                    if u != v {
+                        parent[u.max(v)] = u.min(v);
+                    }
+                }
+            }
+        }
+        // (root, tile) of every node, then one entry per component.
+        let mut members: Vec<(usize, usize, u64)> = Vec::with_capacity(nodes);
+        for (t, s) in sizes.iter().enumerate() {
+            for (l, &cells) in s.iter().enumerate() {
+                members.push((root(&mut parent, offset[t] + l), t, cells));
+            }
+        }
+        members.sort_unstable();
+        let mut stats = ComponentStats::default();
+        let mut start = 0;
+        while start < members.len() {
+            let r = members[start].0;
+            let end = start + members[start..].iter().take_while(|m| m.0 == r).count();
+            let group = &members[start..end];
+            let cells: u64 = group.iter().map(|m| m.2).sum();
+            let mut tiles: Vec<usize> = group.iter().map(|m| m.1).collect();
+            tiles.dedup();
+            let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+            for &t in &tiles {
+                let id = spec.id_at(t);
+                x0 = x0.min(id.tx);
+                x1 = x1.max(id.tx);
+                y0 = y0.min(id.ty);
+                y1 = y1.max(id.ty);
+            }
+            stats.components += 1;
+            stats.cells += cells;
+            stats.max_cells = stats.max_cells.max(cells);
+            if tiles.len() > 1 {
+                stats.cross_tile += 1;
+                stats.cross_tile_cells += cells;
+            }
+            if tiles.len() as u64 > stats.max_tiles {
+                stats.max_tiles = tiles.len() as u64;
+                stats.max_tiles_across = u64::from(x1 - x0 + 1);
+                stats.max_tiles_down = u64::from(y1 - y0 + 1);
+            }
+            start = end;
+        }
+        stats
     }
 
     /// What tile `id`'s unresolved perimeter cells see across its edges.
@@ -1342,9 +1498,19 @@ fn inside_crossing(frame: &Frame, dirs: &[u8]) -> bool {
 /// Marks the core's unresolved cells: [`DEFERRED`] for components that
 /// reach the tile edge, [`INTERIOR`] for the rest. Returns the unresolved
 /// and deferred cell counts.
-fn classify(frame: &Frame, dirs: &[u8], class: &mut Vec<u8>, stack: &mut Vec<u32>) -> (u64, u64) {
+fn classify(
+    frame: &Frame,
+    dirs: &[u8],
+    class: &mut Vec<u8>,
+    labels: &mut Vec<u32>,
+    sizes: &mut Vec<u64>,
+    stack: &mut Vec<u32>,
+) -> (u64, u64) {
     class.clear();
     class.resize(frame.cells(), 0);
+    labels.clear();
+    labels.resize(frame.cells(), 0);
+    sizes.clear();
     let mut flats = 0;
     for ly in 0..frame.h {
         let start = frame.at(0, ly);
@@ -1355,15 +1521,33 @@ fn classify(frame: &Frame, dirs: &[u8], class: &mut Vec<u8>, stack: &mut Vec<u32
             }
         }
     }
-    stack.clear();
+    // Each component reaching the edge gets a label, 1 up.
+    let mut deferred = 0;
     for (lx, ly) in frame.perimeter() {
         let i = frame.at(lx, ly);
         if class[i] == INTERIOR {
+            let label = sizes.len() as u32 + 1;
             class[i] = DEFERRED;
+            labels[i] = label;
+            stack.clear();
             stack.push(i as u32);
+            let mut cells = 1;
+            while let Some(c) = stack.pop() {
+                let i = c as usize;
+                for k in 1..9 {
+                    let j = frame.nb(i, k);
+                    if class[j] == INTERIOR {
+                        class[j] = DEFERRED;
+                        labels[j] = label;
+                        cells += 1;
+                        stack.push(j as u32);
+                    }
+                }
+            }
+            sizes.push(cells);
+            deferred += cells;
         }
     }
-    let deferred = flood(frame, class, stack);
     (flats, deferred)
 }
 
