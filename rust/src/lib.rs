@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! In-memory PitRemove, D8FlowDir, and AreaD8 kernels for TauDEM.
+//! In-memory PitRemove, D8FlowDir, and AreaD8 kernels for TauDEM, and the
+//! tiled, out-of-core AreaD8 ([`area_tiled`]).
 
 mod area;
+pub mod area_tiled;
 mod d8;
 pub mod d8_tiled;
 mod flood;

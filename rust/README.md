@@ -7,7 +7,7 @@ limit the number of compute and GeoTIFF worker threads.
 ```text
 taudem-rs pitremove -z dem.tif -fel fel.tif [-4] [-depmask mask.tif]
 taudem-rs d8flowdir -fel fel.tif -p p.tif -sd8 sd8.tif
-taudem-rs aread8 -p p.tif -ad8 ad8.tif [-nc]
+taudem-rs aread8 -p p.tif -ad8 ad8.tif [-nc] [--exact-area]
 taudem-rs pipeline -z dem.tif [-fel fel.tif] [-p p.tif] [-sd8 sd8.tif] [-ad8 ad8.tif]
                    [-4] [-depmask mask.tif] [-nc]
 ```
@@ -39,11 +39,12 @@ limit, set `TERRIO_TIFF_MAX_CHUNK_BYTES` to at least the largest decoded block.
 Every subcommand also accepts `--mode auto|in-memory|tiled`, `--max-memory
 BYTES` (such as `4G` or `512M`; default the smaller of 65% of usable and 75%
 of available memory), `--tile-size CELLS` and `--scratch-dir DIR` (default
-the system temporary directory). PitRemove and D8FlowDir support
+the system temporary directory). PitRemove, D8FlowDir and AreaD8 support
 out-of-core execution with `--mode tiled`; their outputs are identical to
 the in-memory ones. Auto mode selects it when the in-memory estimate
-(PitRemove 8 bytes per cell, or 9 with `-depmask`; D8FlowDir about 10)
-exceeds the budget or the raster exceeds the in-memory index limit. For
+(PitRemove 8 bytes per cell, or 9 with `-depmask`; D8FlowDir about 10;
+AreaD8 6) exceeds the budget or the raster exceeds the in-memory index
+limit. For
 the other subcommands `--mode tiled` stops with an error and `auto` runs
 in memory. An explicit PitRemove tile side can be 16 through 4096 if its
 working buffers and perimeter fit the budget.
@@ -58,10 +59,24 @@ consumer. The library's `tiling` module holds the shared infrastructure
 tables, and a background GeoTIFF tile writer); see
 `docs/rust-port/STREAMING.md` section 3.
 
+Tiled AreaD8 (`taudem_rs::area_tiled`) follows Barnes (2017),
+[doi:10.1016/j.envsoft.2017.02.022](https://doi.org/10.1016/j.envsoft.2017.02.022):
+each tile is accumulated alone, the tiles' perimeter exits form a graph
+solved with exact integer counts, and a second pass injects each tile's
+solved inflows. Its output equals in-memory `aread8` bit for bit, including
+the `f32` rounding of TauDEM's sums once a mainstem passes 2^24 cells: the
+few exits past that are recomputed in TauDEM's summation order from the
+tiles that hold them. `--exact-area` (tiled only) instead writes exact
+counts rounded once to `f32`, which differ from TauDEM above 2^24. The
+module documentation gives the exactness argument. The direction tiles are
+kept compressed in the tile store between passes and spill to
+`--scratch-dir` beyond the budget; ELC (1.1 billion cells) runs in 16 s
+with an 830 MB peak working set.
+
 The in-memory implementation supports up to 4,294,967,295 cells, subject
 to available memory. The kernels are also available through the library.
 AreaD8 outlet filtering (`-o`) and weight grids (`-wg`), D8FlowDir imposed
-directions (`-sfdr`), and out-of-core AreaD8 and pipeline are future work.
+directions (`-sfdr`), and the out-of-core pipeline are future work.
 
 ## Memory and threads
 
@@ -116,7 +131,8 @@ breadth-first distance inside a flat would exceed 65,533 cells repeats with
 `docs/rust-port/STREAMING.md` section 6.1 for a tile size and provides
 `assert_tiled_matches_in_memory`; include it with `mod support;`.
 `cargo test --release --test adversarial -- --ignored` also runs the
-17.6-million-cell AreaD8 ramp. To check the background writer's GeoTIFFs
+17.6-million-cell AreaD8 ramp, and `cargo test --release --test area_tiled
+-- --ignored` checks tiled AreaD8 on it. To check the background writer's GeoTIFFs
 with GDAL, run `TAUDEM_GDAL_CHECK_DIR=DIR cargo test --test async_writer`,
 then `python tests/gdal_readback.py DIR` with GDAL's Python bindings.
 `cargo run --release --example tile_codec_bench -- DEM.tif [TILE]` reports
