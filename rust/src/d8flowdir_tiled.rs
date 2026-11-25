@@ -78,7 +78,7 @@ pub fn run(
     let queues = 2 * 4 * threads as u64 * 256 * 256 * 4;
     // The process itself (code, thread stacks, the reader's decode buffers,
     // allocator slack) takes the rest.
-    let reserve = (48 << 20) + budget / 16;
+    let reserve = (64 << 20) + budget / 10;
     let cache_budget = budget
         .saturating_sub(workers + borders + queues + reserve)
         .max(budget / 8);
